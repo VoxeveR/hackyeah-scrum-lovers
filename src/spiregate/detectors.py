@@ -38,7 +38,20 @@ def _card_valid(s: str) -> bool:
     return 13 <= len(s) <= 19 and luhn.is_valid(s)
 
 
-KNOWN_KINDS = frozenset({"IBAN", "LEI", "ISIN", "CARD", "PESEL"})
+KNOWN_KINDS = frozenset({"IBAN", "LEI", "ISIN", "CARD", "PESEL", "SECRET"})
+
+# High-confidence secret formats. For key=value forms only the value (group 1) is masked.
+_SECRETS = [re.compile(p, f) for p, f in [
+    (r"\b((?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16})\b", 0),                                      # AWS access key id
+    (r"(?i)\baws_(?:secret_access_key|session_token)\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{16,})", 0),   # AWS secret / session
+    (r"(-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z]+ )?PRIVATE KEY-----)", 0),  # PEM private key
+    (r"\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b", 0),                         # GitHub
+    (r"\b(sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,})", 0),                                               # OpenAI / Anthropic
+    (r"\b(xox[abposr]-[A-Za-z0-9-]{10,})", 0),                                                      # Slack
+    (r"\b(AIza[0-9A-Za-z_-]{35})\b", 0),                                                           # Google API key
+    (r"\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})", 0),                   # JWT
+    (r"(?i)\b(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|password|passwd)\b[\"']?\s*[=:]\s*[\"']?([^\s\"',;]{12,})", 0),
+]]
 
 # Order matters: earlier kinds claim their span first (an IBAN contains digit runs).
 _CANDIDATES = [
@@ -75,6 +88,13 @@ def find_identifiers(text: str) -> list[Finding]:
             end = start + len(kept)
             taken.append((start, end))
             found.append(Finding(kind, start, end, re.sub(r"[ -]", "", kept).upper()))
+    for rx in _SECRETS:
+        for m in rx.finditer(text):
+            start, end = m.span(1)
+            if any(a < end and start < b for a, b in taken):
+                continue
+            taken.append((start, end))
+            found.append(Finding("SECRET", start, end, m.group(1)))
     return sorted(found, key=lambda f: f.start)
 
 

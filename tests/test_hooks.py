@@ -281,3 +281,43 @@ def test_sdk_tool_returns_masked_result(server):
         return {"name": "Jan Nowak", "pesel": "44051401359"}
 
     assert crm_get_client(client_id="ACME-001") == {"name": "Jan Nowak", "pesel": "[PESEL#1]"}
+
+
+# ----------------------------------------------------------------- credential directories (regression: `ls ~/.aws` passed)
+
+
+@pytest.mark.parametrize("command", [
+    "ls -la ~/.aws", "cat ~/.aws/*", "find ~/.aws -type f -exec cat {} +", "cd ~/.aws && cat config",
+    "for f in ~/.aws/*; do cat $f; done", "ls -R ~/.aws", "cat ${HOME}/.ssh/id_ed25519.pub", "cat ~/.kube/config",
+])
+def test_any_access_to_credential_directories_is_denied(gw, command):
+    decision, reason = denied(hook(gw, "PreToolUse", "Bash", {"command": command}))
+    assert decision == "deny" and "CRED-001" in reason
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("Read", {"file_path": "~/.aws/config"}), ("Glob", {"pattern": "*", "path": "~/.aws"}),
+    ("Glob", {"pattern": "~/.ssh/**"}), ("Grep", {"pattern": "key", "path": "~/.ssh"}),
+])
+def test_file_tools_cannot_reach_credential_directories(gw, tool, args):
+    assert "CRED-001" in denied(hook(gw, "PreToolUse", tool, args))[1]
+
+
+@pytest.mark.parametrize("command", ["ls -la", "git status", "cat ./config.yaml", "echo awsome", "docker ps"])
+def test_everyday_commands_are_not_mistaken_for_credential_access(gw, command):
+    assert denied(hook(gw, "PreToolUse", "Bash", {"command": command})) is None
+
+
+def test_secrets_in_tool_output_are_masked_before_the_model_sees_them(gw):
+    out = updated_output(hook(gw, "PostToolUse", "Bash", {"command": "env"}, response={"stdout":
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nregion=eu-central-1",
+        "stderr": ""}))
+    assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(out) and "wJalrXUtnFEMI" not in json.dumps(out)
+    assert "[SECRET#1]" in out["stdout"] and "region=eu-central-1" in out["stdout"]
+
+
+def test_audit_keeps_masked_arguments_for_investigations(gw):
+    hook(gw, "PreToolUse", "Bash", {"command": "cat ~/.aws/* && echo AKIAIOSFODNN7EXAMPLE PESEL 44051401359"})
+    rec = gw.audit.tail(1)[0]["tool_calls"][0]
+    assert "cat ~/.aws/*" in rec["args_redacted"]
+    assert "AKIAIOSFODNN7EXAMPLE" not in rec["args_redacted"] and "44051401359" not in rec["args_redacted"]

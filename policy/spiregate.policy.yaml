@@ -23,7 +23,7 @@
 apiVersion: spiregate.policy/v1
 
 meta:
-  policy_rev: 5
+  policy_rev: 15
   owner: ai-controls
   active_profile: standard        # spróbuj: dev (wszystko tylko loguje, poza inwariantami)
 
@@ -131,6 +131,14 @@ controls:
       on_fail: withhold
       mode: enforce             # na start można dać monitor i porównać decyzje na trudnych przypadkach
 
+  # Druga linia za CRED-001: gdy sekret mimo to trafi do wyniku narzędzia, model widzi tylko [SECRET#n].
+  - id: DET-SECRET-001
+    title: Sekrety w wynikach narzędzi (klucze AWS, GitHub, OpenAI, klucze prywatne, hasła)
+    phase: tool_result
+    detector: identifiers
+    kinds: [SECRET]
+    action: redact
+
   - id: CTL-SELF-001
     title: Agent nie może zmieniać plików ani procesów samego SpireGate
     phase: tool_call
@@ -138,10 +146,11 @@ controls:
     action: block
 
   - id: CRED-001
-    title: Dostęp do plików z poświadczeniami (~/.aws, ~/.ssh, .netrc, *.pem...)
+    title: Dostęp do katalogów i plików z poświadczeniami (~/.aws, ~/.ssh, ~/.kube, .netrc, *.pem...)
     phase: tool_call
     when: 'facts.touches_credentials'
     action: block
+    mode: enforce
 
   - id: EXEC-HYG-001
     title: Pobranie i uruchomienie kodu jednym poleceniem (curl | sh, base64 -d | sh)

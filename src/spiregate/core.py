@@ -329,7 +329,9 @@ class Gateway:
                 s1_ms += res.latency_ms
                 sigs.append(self._s1_signal(c, mode, res, f"{name}: czy akcja wykracza poza polecenie?"))
         decision = _combine(sigs)
+        preview = Redactor().redact(json.dumps(args, ensure_ascii=False))[0]  # PII and secrets masked, never raw
         record = {"tool": name, "args_sha256": hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+                  "args_redacted": preview if len(preview) <= 600 else preview[:597] + "...",
                   "effect": effective["effect"], "destinations": facts["destinations"], "decision": decision,
                   "controls": [s["control"] for s in sigs if s["enforced"] and s["action"] in ("block", "escalate")]}
         return decision, sigs, record, s1_ms
@@ -420,6 +422,8 @@ class Gateway:
                 sensitive = bool(unique) or pol.class_rank(spec.output_class) >= pol.class_rank("client_pii")
                 obj, outcome = await self._verify_residue(pol, c, obj, kinds, sensitive, signals)
                 enforcing = _verify_mode(pol, c) == "enforce"
+                if outcome in ("masked", "withheld"):  # suspected identifiers still mean the session touched PII
+                    session["class_rank"] = max(session["class_rank"], pol.class_rank("client_pii"))
                 if outcome in ("masked", "withheld") and enforcing:
                     applied.append(outcome)
                 withheld = withheld or (outcome == "withheld" and enforcing)

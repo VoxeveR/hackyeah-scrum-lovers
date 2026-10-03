@@ -9,7 +9,7 @@ Agent zmienia tylko `base_url` na gateway i dostaje wirtualny klucz; prawdziwe k
 
 ```bash
 uv sync
-make test          # 35 testów, bez kluczy i sieci, ~2 s
+make test          # 74 testy, bez kluczy i sieci, ~2 s
 make demo          # scenariusz KYC bez ataku (skryptowany model, stub Jev)
 make demo-attack   # ten sam scenariusz, strona WWW zawiera ukrytą instrukcję dla AI
 ```
@@ -56,6 +56,22 @@ guard = Guard(key="spire-demo-sdk", session_id="pay-1")
 @guard.tool("send_email")
 def send_email(to, subject, body): ...   # sprawdzane przed wykonaniem, wynik raportowany po
 ```
+
+## Dashboard
+
+`make serve` wypisuje adres panelu z tokenem administratora, np. `http://127.0.0.1:8787/ui/#token=…`.
+Stały token ustawisz w `.env` (`SPIRE_ADMIN_TOKEN=`). Klucz agenta nie otwiera panelu.
+
+| Strona | Co pokazuje |
+|---|---|
+| Przegląd | decyzje i trend z 30 minut, stan bezpieczeństwa, wydajność warstw (p50/p95), System One, agenci |
+| Na żywo | każda decyzja z łańcucha audytu; kliknięcie pokazuje sygnały, prawdopodobieństwa Jev, hash |
+| Kontrolki | tryb enforce/monitor/off i profil, zmiana działa od następnego żądania (inwarianty zablokowane) |
+| Playground | dowolna akcja lub wynik narzędzia przez prawdziwą ścieżkę decyzji, z tym, co zobaczy agent |
+| Audyt | weryfikacja łańcucha, eksport JSONL / CSV / OCSF, historia przeładowań polityki |
+
+Panel nie ma zależności zewnętrznych (działa offline). Zmiana z panelu podmienia w pliku polityki tylko zmienione linie
+i jest walidowana przed zapisem.
 
 ## Polityka
 

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+from . import admin as adm
 
 from .actions import protected_roots
 from .audit import AuditLog
@@ -20,6 +24,7 @@ from .upstream import OpenAIUpstream, StubUpstream
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = ROOT / "policy" / "spiregate.policy.yaml"
 DEFAULT_AUDIT = ROOT / "var" / "audit.jsonl"
+DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
@@ -48,8 +53,23 @@ def build_gateway(policy_path: Path = DEFAULT_POLICY, audit_path: Path = DEFAULT
     )
 
 
-def create_app(gateway: Gateway) -> FastAPI:
+def create_app(gateway: Gateway, admin_token: str | None = None) -> FastAPI:
     app = FastAPI(title="SpireGate", version="0.1.0")
+    # The admin plane has its own token; an agent's virtual key never opens it.
+    app.state.admin_token = admin_token or os.environ.get("SPIRE_ADMIN_TOKEN") or secrets.token_urlsafe(12)
+    verify_cache = adm.AuditVerifyCache(gateway.audit.path)
+
+    @app.middleware("http")
+    async def no_stale_dashboard(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/ui"):
+            response.headers["Cache-Control"] = "no-cache"  # always revalidate, so a redeploy shows up at once
+        return response
+
+    def require_admin(request: Request) -> None:
+        given = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or request.query_params.get("token", "")
+        if not secrets.compare_digest(given, app.state.admin_token):
+            raise HTTPException(status_code=401, detail="SpireGate: wymagany token administratora")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> JSONResponse:
@@ -72,6 +92,81 @@ def create_app(gateway: Gateway) -> FastAPI:
         except ValueError:
             return JSONResponse({"stdout": "", "stderr": "SpireGate: niepoprawny JSON z hooka\n", "exit": 2})
         return JSONResponse(await gateway.hook(_key(request), fmt, event))
+
+    # ------------------------------------------------------------------ admin plane (dashboard)
+    @app.get("/v1/admin/summary", dependencies=[Depends(require_admin)])
+    async def admin_summary() -> dict:
+        pol = gateway.store.get()
+        return adm.summarize(gateway.audit.tail(2000), pol, gateway.store, verify_cache.get())
+
+    @app.get("/v1/admin/events", dependencies=[Depends(require_admin)])
+    async def admin_events(after: int = 0, limit: int = 200) -> dict:
+        entries = [e for e in gateway.audit.tail(2000) if e["seq"] > after]
+        return {"entries": entries[-limit:]}
+
+    @app.get("/v1/admin/controls", dependencies=[Depends(require_admin)])
+    async def admin_controls() -> dict:
+        pol = gateway.store.get()
+        return {"controls": adm.controls_view(pol, gateway.audit.tail(2000)), "profile": pol.profile_name,
+                "profiles": list(pol.doc.profiles), "rev": pol.rev, "sha": pol.sha, "error": gateway.store.last_error}
+
+    @app.post("/v1/admin/controls/{control_id}", dependencies=[Depends(require_admin)])
+    async def admin_set_mode(control_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        try:
+            adm.edit_policy(gateway.store.path, control_id=control_id, mode=body.get("mode"))
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        pol = gateway.store.get()
+        return JSONResponse({"ok": gateway.store.last_error is None, "rev": pol.rev, "sha": pol.sha,
+                             "error": gateway.store.last_error})
+
+    @app.post("/v1/admin/profile", dependencies=[Depends(require_admin)])
+    async def admin_set_profile(request: Request) -> JSONResponse:
+        body = await request.json()
+        try:
+            adm.edit_policy(gateway.store.path, profile=body.get("profile"))
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        pol = gateway.store.get()
+        return JSONResponse({"ok": gateway.store.last_error is None, "rev": pol.rev, "profile": pol.profile_name})
+
+    @app.get("/v1/admin/identities", dependencies=[Depends(require_admin)])
+    async def admin_identities() -> dict:
+        pol = gateway.store.get()
+        return {"identities": [{"key": k, **v.model_dump()} for k, v in pol.doc.identities.items()],
+                "tools": sorted(k for k in pol.doc.tools if k != "*")}
+
+    @app.post("/v1/admin/playground", dependencies=[Depends(require_admin)])
+    async def admin_playground(request: Request) -> dict:
+        """Judges' ad-hoc checks: the real decision path, with the trace it produced."""
+        body = await request.json()
+        start = len(gateway.tracer.lines)
+        req = {"phase": body.get("phase", "pre"), "session_id": body.get("session_id") or "playground",
+               "tool": body.get("tool"), "args": body.get("args") or {}, "result": body.get("result"),
+               "user_request": body.get("user_request"), "cwd": str(ROOT / "demo" / "claude-code")}
+        out = await gateway.decide(body.get("agent_key"), req, surface="playground")
+        return {**out, "trace": gateway.tracer.lines[start:]}
+
+    @app.get("/v1/admin/audit/verify", dependencies=[Depends(require_admin)])
+    async def admin_verify() -> dict:
+        ok, msg = verify_cache.get()
+        return {"ok": ok, "message": msg}
+
+    @app.get("/v1/admin/audit/export", dependencies=[Depends(require_admin)])
+    async def admin_export(fmt: str = "jsonl") -> Response:
+        if fmt not in ("jsonl", "csv", "ocsf"):
+            raise HTTPException(status_code=400, detail="fmt: jsonl | csv | ocsf")
+        body, media = adm.export(gateway.audit.tail(100000), fmt)
+        ext = {"jsonl": "jsonl", "csv": "csv", "ocsf": "ocsf.jsonl"}[fmt]
+        return Response(body, media_type=media, headers={"Content-Disposition": f'attachment; filename="spiregate-audit.{ext}"'})
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
+    if DASHBOARD_DIR.exists():
+        app.mount("/ui", StaticFiles(directory=DASHBOARD_DIR, html=True), name="ui")
 
     @app.get("/v1/models")
     async def models() -> dict:

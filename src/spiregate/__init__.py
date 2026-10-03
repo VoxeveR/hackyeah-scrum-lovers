@@ -18,6 +18,7 @@ def main() -> None:
     s = sub.add_parser("serve", help="uruchom gateway (OpenAI-compatible) na 127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
     s.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
+    s.add_argument("--audit", type=Path, default=DEFAULT_AUDIT)
 
     d = sub.add_parser("demo", help="scenariusz KYC: agent + gateway w jednym procesie")
     d.add_argument("--scenario", choices=["benign", "attack"], default="benign")
@@ -36,7 +37,10 @@ def main() -> None:
 
         from .app import build_gateway, create_app
 
-        uvicorn.run(create_app(build_gateway(args.policy)), host="127.0.0.1", port=args.port, log_level="warning")
+        app = create_app(build_gateway(args.policy, args.audit))
+        print(f"SpireGate na http://127.0.0.1:{args.port}  ·  dashboard: "
+              f"http://127.0.0.1:{args.port}/ui/#token={app.state.admin_token}", flush=True)
+        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
     elif args.cmd == "demo":
         from .demo.run import run_demo
 

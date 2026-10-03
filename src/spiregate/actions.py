@@ -29,8 +29,16 @@ _PIPE_TO_SHELL = re.compile(
 _KILL_SELF = re.compile(r"\b(?:kill|pkill|killall)\b[^;&|]*\b(?:spiregate|uvicorn|spire_hook)\b", re.I)
 _INLINE_HTTP = re.compile(r"\b(?:python3?|node|ruby|perl)\b.*\s-[ce]\s.*(?:https?://|socket|requests|urllib|fetch\()", re.I)
 
-CREDENTIAL_GLOBS = ["*/.aws/credentials", "*/.aws/config", "*/.ssh/id_*", "*/.netrc", "*/.docker/config.json",
-                    "*/.npmrc", "*/.pypirc", "*/.config/gcloud/*", "*.pem", "*/.kube/config", "*/.git-credentials"]
+# Whole directories: listing, globbing or reading anything inside them is credential access.
+CREDENTIAL_DIRS = ["~/.aws", "~/.ssh", "~/.gnupg", "~/.kube", "~/.docker", "~/.azure", "~/.config/gcloud", "~/.oci"]
+# Single files that hold secrets wherever they live.
+CREDENTIAL_GLOBS = ["*/.netrc", "*/.npmrc", "*/.pypirc", "*/.git-credentials", "*.pem", "*/id_rsa*", "*/id_ed25519*",
+                    "*/id_ecdsa*", "*/credentials.json", "*/.vault-token"]
+# Markers anywhere in a shell command, for forms paths cannot catch: `cd ~/.aws && cat config`, loops, find.
+_CREDENTIAL_MARKER = re.compile(
+    r"(?:^|[\s'\"=:(/~}])\.(?:aws|ssh|gnupg|kube|docker|azure|oci)\b|\.config/gcloud\b"
+    r"|\b(?:id_rsa|id_ed25519|id_ecdsa|\.netrc|\.git-credentials|\.pypirc|\.vault-token)\b")
+_GLOB_CHARS = re.compile(r"[*?\[]")
 
 
 @dataclass
@@ -71,6 +79,10 @@ def _command_of(args: dict[str, Any]) -> str:
 
 
 def _resolve(p: str, cwd: str | None) -> str:
+    p = re.sub(r"\$\{?HOME\}?", os.path.expanduser("~"), p)  # $HOME/.aws and ${HOME}/.aws
+    g = _GLOB_CHARS.search(p)
+    if g:  # ~/.aws/* -> ~/.aws : the directory a wildcard would expand inside
+        p = p[:g.start()].rstrip("/") or "/"
     p = os.path.expanduser(p)
     if not os.path.isabs(p):
         p = os.path.join(cwd or os.getcwd(), p)
@@ -106,8 +118,15 @@ def compute_facts(name: str, spec: dict[str, Any], args: dict[str, Any], *, allo
         if to:
             dests = [str(x) for x in to] if isinstance(to, list) else [str(to)]
         raw_paths = [str(args[k]) for k in PATH_KEYS if args.get(k)]
+        if name in ("Glob", "Grep") and isinstance(args.get("pattern"), str) and "/" in args["pattern"]:
+            raw_paths.append(args["pattern"])
 
     resolved = [_resolve(p, cwd) for p in raw_paths]
+    cred_dirs = [os.path.realpath(os.path.expanduser(d)) for d in CREDENTIAL_DIRS]
+    command = _command_of(args) if name in SHELL_TOOLS else ""
+    touches_credentials = (any(_under(r, d) for r in resolved for d in cred_dirs)
+                           or any(fnmatch.fnmatch(r, g) for r in resolved for g in CREDENTIAL_GLOBS)
+                           or bool(command and _CREDENTIAL_MARKER.search(command)))
     egress_allow = spec.get("egress_allow", [])
     facts = {
         "tool_allowed": any(fnmatch.fnmatchcase(name, p) for p in allowed_tools),
@@ -116,7 +135,7 @@ def compute_facts(name: str, spec: dict[str, Any], args: dict[str, Any], *, allo
         "recipient_internal": bool(dests) and all(_dest_internal(d, internal_domains) for d in dests),
         "pipe_to_shell": pipe,
         "touches_protected": kills or any(_under(r, root) for r in resolved for root in protected_roots),
-        "touches_credentials": any(fnmatch.fnmatch(r, g) for r in resolved for g in CREDENTIAL_GLOBS),
+        "touches_credentials": touches_credentials,
     }
     return effective, facts
 
