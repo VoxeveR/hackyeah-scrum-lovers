@@ -1,0 +1,23 @@
+# Fragment do ~/.codex/config.toml (albo <repo>/.codex/config.toml) — hooki SpireGate dla Codex CLI.
+# NIEPRZETESTOWANE na żywym Codexie (nie jest zainstalowany na laptopie demo). Format wg dokumentacji Codex hooks.
+# Ścieżkę do spire_hook.py podaj absolutną.
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "python3 /ABSOLUTNA/SCIEZKA/hackyeah-scrum-lovers/hooks/spire_hook.py --format codex --key spire-demo-codex"
+timeout = 6
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 /ABSOLUTNA/SCIEZKA/hackyeah-scrum-lovers/hooks/spire_hook.py --format codex --key spire-demo-codex"
+timeout = 6
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python3 /ABSOLUTNA/SCIEZKA/hackyeah-scrum-lovers/hooks/spire_hook.py --format codex --key spire-demo-codex"
+timeout = 6

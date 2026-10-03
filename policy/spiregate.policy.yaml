@@ -1,0 +1,204 @@
+# spiregate.policy.yaml — jedno źródło prawdy dla SpireGate.
+#
+# Plik jest wczytywany ponownie przy każdym żądaniu, jeśli zmienił się na dysku (bez restartu).
+# Błędna edycja (zły YAML, zły schemat, CEL się nie kompiluje, usunięty inwariant) NIE wyłącza
+# ochrony: gateway zostaje na ostatniej poprawnej wersji i pokazuje błąd w logu.
+#
+# Akcje:  allow | redact | taint | escalate | block
+# Tryby:  enforce (działa) | monitor (tylko loguje "would_<akcja>") | off
+# Władza: authoritative = reguła deterministyczna, decyduje sama
+#         corroborating = heurystyka/ML, może oznaczyć (taint), sama nie blokuje
+#         advisory      = System One (Jev) / LLM, może najwyżej eskalować
+# Inwarianty (ACC-TOOL-001, IFC-TRIFECTA-001, CTL-SELF-001) zawsze działają w trybie enforce.
+#
+# Warunki `when` są w CEL. Dostępne zmienne:
+#   identity  – kto pyta (z wirtualnego klucza): agent_id, desk, allowed_tools, ...
+#   session   – etykiety sesji: integrity ("trusted"/"untrusted"), class, class_rank (0..4)
+#   tool      – narzędzie: name, effect (dla poleceń shella z siecią: external_send), reversible
+#   args      – argumenty wywołania
+#   facts     – fakty policzone przez gateway: tool_allowed, destinations, recipient_allowed,
+#               recipient_internal, pipe_to_shell, touches_protected, touches_credentials
+# Jeśli warunek zwróci błąd (np. brak pola), zadziała `on_eval_error` profilu (fail-closed).
+
+apiVersion: spiregate.policy/v1
+
+meta:
+  policy_rev: 5
+  owner: ai-controls
+  active_profile: standard        # spróbuj: dev (wszystko tylko loguje, poza inwariantami)
+
+profiles:
+  standard:  {default_mode: enforce, on_eval_error: block}
+  dev:       {default_mode: monitor, on_eval_error: escalate}
+
+org:
+  internal_domains: ["gs.com"]
+  # Dodatkowe ścieżki, których agent nie może zmieniać (pliki samego SpireGate są chronione zawsze).
+  protected_paths: ["~/.claude/settings.json", "/Library/Application Support/ClaudeCode"]
+
+# Klasy danych od najmniej do najbardziej wrażliwej (rank 0..4).
+classification: [public, internal, confidential, client_pii, mnpi]
+
+# Wirtualne klucze wydawane agentom. Prawdziwe klucze (OpenAI, Jev) zna tylko gateway.
+identities:
+  spire-demo-kyc:
+    agent_id: kyc-agent
+    desk: kyc-onboarding
+    supervisor: ola
+    allowed_tools: [crm_get_client, web_fetch, send_email]
+  spire-demo-claude:
+    agent_id: claude-code-demo
+    desk: engineering
+    supervisor: oskar
+    allowed_tools: ["*"]          # Claude Code ma wiele narzędzi wbudowanych; ryzyko oceniamy po metadanych
+  spire-demo-codex:
+    agent_id: codex-demo
+    desk: engineering
+    supervisor: oskar
+    allowed_tools: ["*"]
+  spire-demo-sdk:
+    agent_id: payments-app
+    desk: payments-ops
+    supervisor: ola
+    allowed_tools: [send_email, crm_get_client]
+
+# Dozwolone modele (ścieżka proxy). Model spoza listy jest blokowany.
+# max_class = najwyższa klasa danych, jaką ten model może zobaczyć.
+models:
+  - {id: gpt-5-mini, upstream: openai, location: external, max_class: internal}
+  - {id: stub-model, upstream: stub,   location: external, max_class: internal}   # skryptowany "model" do nauki i testów
+
+# Metadane ryzyka narzędzi należą do gatewaya (nie ufamy opisom od agenta ani serwera).
+tools:
+  # narzędzia agenta KYC (ścieżka proxy)
+  crm_get_client: {effect: read, output_class: client_pii}
+  web_fetch:      {effect: read, output_integrity: untrusted}
+  send_email:     {effect: external_send, reversible: false, egress_allow: ["*@gs.com", "*@acme-corp.com"]}
+  # narzędzia wbudowane Claude Code (ścieżka hooków)
+  Read:      {effect: read}
+  Glob:      {effect: read}
+  Grep:      {effect: read}
+  LS:        {effect: read}
+  TodoWrite: {effect: read}
+  Write:     {effect: write, reversible: false}
+  Edit:      {effect: write}
+  MultiEdit: {effect: write}
+  WebFetch:  {effect: read, output_integrity: untrusted}
+  WebSearch: {effect: read, output_integrity: untrusted}
+  # Shell: polecenie z dostępem do sieci staje się wysyłką (external_send); egress_allow = dozwolone hosty.
+  # Wynik polecenia sieciowego jest niezaufany, wynik `ls` czy `echo` nie.
+  Bash:      {effect: exec, egress_allow: ["localhost", "127.0.0.1", "*.gs.com", "*.acme-corp.com"]}
+  # Codex
+  shell:       {effect: exec, egress_allow: ["localhost", "127.0.0.1", "*.gs.com", "*.acme-corp.com"]}
+  apply_patch: {effect: write}
+  "*":         {effect: exec, reversible: false, output_integrity: untrusted}   # nieznane narzędzie
+
+# Port System One. Backend wymieniasz jednym polem: jev | stub | off.
+# Bez TYPESAFE_API_KEY gateway sam przełącza się na stub (i pisze to w logu).
+# Do Jev wysyłamy wyłącznie treść PO maskowaniu identyfikatorów.
+systemone:
+  backend: jev
+  url: https://api.typesafe.ai/v1/systemone
+  model: jev-latest
+  timeout_ms: 1500
+
+controls:
+  - id: ACC-TOOL-001
+    title: Agent może wołać tylko narzędzia ze swojej tożsamości
+    phase: tool_call
+    when: '!facts.tool_allowed'
+    action: block
+
+  # Agent nigdy nie widzi PESEL-u: numery z poprawną sumą kontrolną są maskowane w KAŻDYM wyniku
+  # narzędzia, zanim trafi do agenta. Claude Code: podmiana wyniku w PostToolUse (updatedToolOutput).
+  # Proxy (OpenAI): maskowanie przed modelem, niezależnie od max_class. SDK: zamaskowany wynik w odpowiedzi.
+  # Spróbuj: kinds: [PESEL, IBAN], albo mode: monitor (wtedy tylko loguje would_redact).
+  - id: PII-PESEL-001
+    title: Agent nie widzi numerów PESEL klientów
+    phase: tool_result
+    detector: identifiers
+    kinds: [PESEL]
+    action: redact
+    # Druga linia obrony: po maskowaniu System One (Jev/Laya) potwierdza, że PESEL-u nie ma.
+    # Pytany tylko, gdy filtr znajdzie ślady (cyfry w grupach, liczby słownie, cyfry obok "PESEL")
+    # albo wynik pochodzi ze źródła z danymi klientów. Jeśli zgłosi resztkę: maskujemy podejrzane
+    # fragmenty i pytamy drugi raz; gdy dalej zgłasza, wynik jest WSTRZYMANY (agent dostaje komunikat).
+    verify:
+      question: Czy ten tekst nadal zawiera numer PESEL albo jego część?
+      positive: 11-cyfrowy numer identyfikacyjny osoby w dowolnej formie, np. z odstępami, zapisany słownie, częściowo podany albo zakodowany
+      negative: brak takiego numeru; znaczniki w nawiasach typu [PESEL#1] lub [PESEL?#1] są już zamaskowane i się nie liczą; numery zamówień, faktur i telefonów to nie PESEL
+      threshold: 0.7            # kalibracja na Jev 1.13.0 (9 przypadków, 2026-10-03): "nie" ≤ 0.17, "tak" ≥ 0.83
+      on_fail: withhold
+      mode: enforce             # na start można dać monitor i porównać decyzje na trudnych przypadkach
+
+  - id: CTL-SELF-001
+    title: Agent nie może zmieniać plików ani procesów samego SpireGate
+    phase: tool_call
+    when: 'facts.touches_protected'
+    action: block
+
+  - id: CRED-001
+    title: Dostęp do plików z poświadczeniami (~/.aws, ~/.ssh, .netrc, *.pem...)
+    phase: tool_call
+    when: 'facts.touches_credentials'
+    action: block
+
+  - id: EXEC-HYG-001
+    title: Pobranie i uruchomienie kodu jednym poleceniem (curl | sh, base64 -d | sh)
+    phase: tool_call
+    when: 'facts.pipe_to_shell'
+    action: block
+
+  - id: EGRESS-001
+    title: Wysyłka tylko do dozwolonych odbiorców i hostów
+    phase: tool_call
+    when: 'tool.effect == "external_send" && !facts.recipient_allowed'
+    action: block
+    # Przykład weryfikacji reguły akcji przez System One: gdy reguła NIE zadziałała, Jev ocenia,
+    # czy akcja i tak ją łamie. Przy akcjach wolno najwyżej eskalować (on_fail: escalate).
+    # verify:
+    #   question: Czy ta akcja wysyła dane firmy lub klienta do odbiorcy spoza banku?
+    #   positive: odbiorca lub host nie należy do banku, a w argumentach są dane klienta lub dokumenty
+    #   negative: odbiorca jest wewnętrzny albo wysyłane są tylko dane publiczne
+    #   threshold: 0.85
+    #   on_fail: escalate
+    #   mode: monitor
+
+  - id: IFC-TRIFECTA-001
+    title: Niezaufana treść + dane prywatne + wysyłka poza firmę
+    phase: tool_call
+    when: >-
+      session.integrity == "untrusted" && session.class_rank >= 2 &&
+      tool.effect == "external_send" && !facts.recipient_internal
+    action: block
+
+  - id: DET-FIN-ID-001
+    title: Identyfikatory klienta (IBAN, LEI, ISIN, karta, PESEL) z sumą kontrolną
+    phase: to_model
+    detector: fin_identifiers
+    action: redact            # maskujemy, gdy klasa danych przekracza max_class modelu
+
+  - id: INJ-LEX-001
+    title: Słownik wstrzykniętych poleceń (EN/PL) i ukryty tekst w niezaufanej treści
+    phase: tool_result
+    detector: injection_lexicon
+    action: taint
+    authority: corroborating
+
+  - id: S1-JEV-001
+    title: 'System One (Jev): czy niezaufany tekst zawiera polecenia dla agenta'
+    phase: tool_result
+    detector: systemone_directed_at_agent
+    action: escalate
+    authority: advisory
+    mode: monitor             # najpierw tylko obserwujemy; po kalibracji -> enforce
+    escalate_at: 0.8
+
+  - id: S1-JEV-002
+    title: 'System One (Jev): czy ryzykowne wywołanie zgadza się z poleceniem użytkownika'
+    phase: tool_call
+    detector: systemone_matches_goal
+    action: escalate
+    authority: advisory
+    mode: monitor
+    escalate_at: 0.8          # eskaluj, gdy P(nie zgadza się z celem) >= 0.8

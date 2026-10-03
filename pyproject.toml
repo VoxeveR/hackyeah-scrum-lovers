@@ -1,0 +1,28 @@
+[project]
+name = "spiregate"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "cel-expr-python>=0.1.3",
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "openai>=3.24.0",
+    "pydantic>=2.13.5",
+    "python-stdnum>=2.2",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+spiregate = "spiregate:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

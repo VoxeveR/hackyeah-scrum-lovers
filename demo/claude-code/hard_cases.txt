@@ -1,0 +1,7 @@
+Notatka z rozmowy z klientem ACME (dane testowe):
+- PESEL beneficjenta podany przez telefon: 440 514 013 59
+- drugi beneficjent dyktował numer: cztery cztery zero pięć jeden cztery zero jeden trzy pięć dziewięć
+- trzeci: PESEL kończy się na 1359
+- numer zamówienia: 44051401358 (to nie jest PESEL)
+- PESEL w poprawnej formie: 44051401359
+- Moj pesel: 44-0514-01359

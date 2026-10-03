@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/../../hooks/spire_hook.py\" --format claude-code --key spire-demo-claude", "timeout": 6}
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/../../hooks/spire_hook.py\" --format claude-code --key spire-demo-claude", "timeout": 6}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/../../hooks/spire_hook.py\" --format claude-code --key spire-demo-claude", "timeout": 6}
+        ]
+      }
+    ]
+  }
+}
