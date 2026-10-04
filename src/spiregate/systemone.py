@@ -1,7 +1,7 @@
 """System One port: typed questions to Jev (TypeSafe) or any /v1/systemone-compatible backend.
 
-Only advisory: answers can raise a flag or escalate, never allow or block on their own.
-Only redacted text is ever sent to a hosted backend.
+Answers are probabilities; the policy maps them to approve / review / block per rule. System One never
+loosens a deterministic decision. Only redacted text is ever sent to a hosted backend.
 """
 
 from __future__ import annotations
@@ -61,27 +61,50 @@ class S1Result:
 class SystemOneClient:
     def __init__(self, http: httpx.AsyncClient | None = None):
         self._http = http or httpx.AsyncClient()
+        self.on_usage: Callable[[str, int], None] | None = None  # (backend, input_tokens) -> cost accounting
+        self.on_event: Callable[[dict[str, Any]], None] | None = None  # start/end of each question -> live stream
 
     @staticmethod
     def resolve_backend(spec: SystemOneSpec) -> tuple[str, str | None]:
         backend = os.environ.get("SPIRE_SYSTEMONE_BACKEND", spec.backend)
         if backend == "jev" and not os.environ.get("TYPESAFE_API_KEY"):
-            return "stub", "brak TYPESAFE_API_KEY, używam stuba"
+            return "stub", "no TYPESAFE_API_KEY, using the stub"
         return backend, None
 
     async def ask(self, spec: SystemOneSpec, question: str, state: Any) -> S1Result:
-        return await self.ask_questions(spec, QUESTIONS[question], state, question,
-                                        stub=lambda st: _stub_answer(question, st))
+        b = await self.ask_bundle(spec, QUESTIONS[question], state, {question: lambda st: _stub_answer(question, st)})
+        return b.result(question)
 
     async def ask_questions(self, spec: SystemOneSpec, questions: dict[str, Any], state: Any, primary: str,
                             stub: Callable[[Any], float]) -> S1Result:
-        """Any set of typed questions in one call; `primary` must be a noul whose probability we act on."""
+        b = await self.ask_bundle(spec, questions, state, {primary: stub})
+        return b.result(primary)
+
+    async def ask_bundle(self, spec: SystemOneSpec, questions: dict[str, Any], state: Any,
+                         stubs: dict[str, Callable[[Any], float]], meta: dict[str, Any] | None = None) -> "S1Bundle":
+        """All typed questions about one request in ONE call: the latency of one question, not of N.
+        `meta` travels with the live-stream events (e.g. whether a deterministic rule already acted)."""
+        nouls = [k for k, q in questions.items() if q.get("type") == "noul"]
+        kinds = sorted({kind_of(k) for k in nouls})
+        if self.on_event:
+            self.on_event({"state": "start", "questions": nouls, "kinds": kinds, **(meta or {})})
+        b = await self._bundle(spec, questions, state, stubs)
+        if self.on_event:
+            self.on_event({"state": "end", "questions": nouls, "kinds": kinds, "backend": b.backend,
+                           "ms": b.latency_ms, "error": bool(b.error), "p": b.probs, **(meta or {})})
+        return b
+
+    async def _bundle(self, spec: SystemOneSpec, questions: dict[str, Any], state: Any,
+                      stubs: dict[str, Callable[[Any], float]]) -> "S1Bundle":
+        nouls = [k for k, q in questions.items() if q.get("type") == "noul"]
         backend, note = self.resolve_backend(spec)
         t = time.perf_counter()
         if backend == "off":
-            return S1Result(primary, "off", None, 0.0, note="System One wyłączony w polityce")
+            return S1Bundle("off", dict.fromkeys(nouls), 0.0, note="System One is switched off in the policy")
         if backend == "stub":
-            return S1Result(primary, "stub", stub(state), _ms(t), note=note)
+            if self.on_usage:
+                self.on_usage("stub", 0)
+            return S1Bundle("stub", {q: (stubs[q](state) if q in stubs else None) for q in nouls}, _ms(t), note=note)
         try:
             r = await self._http.post(
                 spec.url,
@@ -90,13 +113,40 @@ class SystemOneClient:
                 timeout=spec.timeout_ms / 1000,
             )
             if r.status_code != 200:
-                return S1Result(primary, "jev", None, _ms(t), error=f"HTTP {r.status_code}: {r.text[:200]}")
+                return S1Bundle("jev", dict.fromkeys(nouls), _ms(t), error=f"HTTP {r.status_code}: {r.text[:200]}")
             data = r.json()
-            p = data["answers"][primary]["noul"]
-            extra = {k: v.get("choice") for k, v in data["answers"].items() if v.get("type") == "choice"}
-            return S1Result(primary, f"jev:{data.get('model', spec.model)}", float(p), _ms(t), raw=data, extra=extra)
+            if self.on_usage:
+                self.on_usage("jev", int((data.get("usage") or {}).get("input_tokens", 0)))
+            answers = data.get("answers") or {}
+            probs = {q: (float(answers[q]["noul"]) if isinstance(answers.get(q), dict) and answers[q].get("noul") is not None
+                         else None) for q in nouls}
+            extra = {k: v.get("choice") for k, v in answers.items() if isinstance(v, dict) and v.get("type") == "choice"}
+            missing = [q for q, p in probs.items() if p is None]
+            return S1Bundle(f"jev:{data.get('model', spec.model)}", probs, _ms(t), raw=data, extra=extra,
+                            error=f"brak odpowiedzi na {missing}" if missing else None)
         except (httpx.HTTPError, KeyError, ValueError, TypeError) as e:
-            return S1Result(primary, "jev", None, _ms(t), error=f"{type(e).__name__}: {e}")
+            return S1Bundle("jev", dict.fromkeys(nouls), _ms(t), error=f"{type(e).__name__}: {e}")
+
+
+@dataclass
+class S1Bundle:
+    backend: str
+    probs: dict[str, float | None]
+    latency_ms: float
+    note: str | None = None
+    error: str | None = None
+    raw: dict[str, Any] | None = field(default=None, repr=False)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def result(self, question: str) -> S1Result:
+        p = self.probs.get(question)
+        return S1Result(question, self.backend, p, self.latency_ms, note=self.note,
+                        error=self.error if p is None else None, raw=self.raw, extra=self.extra)
+
+
+def kind_of(question: str) -> str:
+    """verify: System One checks what a deterministic rule may have missed; jev: a judgement only System One makes."""
+    return "verify" if question in ("residual", "violates") or question.startswith("verify_") else "jev"
 
 
 def _ms(t: float) -> float:

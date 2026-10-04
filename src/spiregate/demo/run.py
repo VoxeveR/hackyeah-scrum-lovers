@@ -23,8 +23,9 @@ async def run_demo(scenario: str, model: str, policy: Path, gateway_url: str | N
     console = Console()
     console.print(Panel.fit(
         f"Scenariusz: [bold]{scenario}[/]   model: [bold]{model}[/]\n"
-        + ("Strona z wiadomościami zawiera UKRYTĄ instrukcję dla AI." if scenario == "attack"
-           else "Strona z wiadomościami jest zwykłym artykułem."),
+        + {"attack": "Strona z wiadomościami zawiera UKRYTĄ instrukcję dla AI.",
+           "loop": "Serwis wiadomości nie odpowiada, a agent ponawia w kółko to samo wywołanie."
+           }.get(scenario, "Strona z wiadomościami jest zwykłym artykułem."),
         title="SpireGate · demo KYC"))
     tools = DemoTools(scenario=scenario)
     if gateway_url:

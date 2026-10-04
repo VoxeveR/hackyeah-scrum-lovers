@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pl">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -17,15 +17,18 @@
         <div><div class="brand-name">SpireGate</div><div class="brand-sub">AI Control Layer</div></div>
       </div>
       <nav class="nav">
-        <a href="#/overview" data-page="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg>Przegląd</a>
-        <a href="#/live" data-page="live"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 12h3l2-6 4 12 3-9 2 3h4"/></svg>Na żywo<span class="count" id="nav-blocks"></span></a>
-        <a href="#/controls" data-page="controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>Kontrolki</a>
+        <a href="#/overview" data-page="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg>Overview</a>
+        <a href="#/live" data-page="live"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 12h3l2-6 4 12 3-9 2 3h4"/></svg>Live<span class="count" id="nav-blocks"></span></a>
+        <a href="#/policy" data-page="policy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>Policy</a>
+        <a href="#/engine" data-page="engine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-3 3 6 2-4 2 2h5"/><circle cx="3.2" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>Engine</a>
+        <a href="#/budgets" data-page="budgets"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v9M14.6 9.4c-.5-.8-1.5-1.3-2.6-1.3-1.5 0-2.6.8-2.6 1.9 0 2.6 5.3 1.4 5.3 4 0 1.1-1.2 1.9-2.7 1.9-1.2 0-2.2-.5-2.7-1.3"/></svg>Budgets</a>
         <a href="#/playground" data-page="playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v6l-5.5 9.5A1.7 1.7 0 006 21h12a1.7 1.7 0 001.5-2.5L14 9V3"/><path d="M7.5 15h9"/></svg>Playground</a>
-        <a href="#/audit" data-page="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 2.6v5.2c0 4.4-3 8.1-7 9.7-4-1.6-7-5.3-7-9.7V5.6L12 3z"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg>Audyt</a>
+        <a href="#/reports" data-page="reports"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4M10 12h5M10 16h5"/></svg>Reports</a>
+        <a href="#/audit" data-page="audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 2.6v5.2c0 4.4-3 8.1-7 9.7-4-1.6-7-5.3-7-9.7V5.6L12 3z"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg>Audit</a>
       </nav>
       <div class="sidebar-foot">
-        <div class="status-row"><span class="dot" id="conn-dot"></span><span id="conn-text">Łączenie…</span></div>
-        <div class="policy-chip" id="policy-chip">Polityka —</div>
+        <div class="status-row"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+        <div class="policy-chip" id="policy-chip">Policy —</div>
       </div>
     </aside>
 
@@ -49,14 +52,18 @@
     <div class="card">
       <div class="logo"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l7 2.6v5.2c0 4.4-3 8.1-7 9.7-4-1.6-7-5.3-7-9.7V5.6L12 3z"/></svg></div>
       <h2>SpireGate</h2>
-      <p>Podaj token administratora. Gateway wypisuje go przy starcie (<code>make serve</code>).</p>
+      <p>Enter the admin token. The gateway prints it on start (<code>make serve</code>).</p>
       <form id="login-form" class="form">
-        <input type="password" id="login-token" placeholder="Token administratora" autocomplete="off">
-        <button class="btn primary" type="submit" style="justify-content:center">Otwórz panel</button>
+        <input type="password" id="login-token" placeholder="Admin token" autocomplete="off">
+        <button class="btn primary" type="submit" style="justify-content:center">Open dashboard</button>
       </form>
     </div>
   </div>
 
+  <script src="engine.js"></script>
+  <script src="policy.js"></script>
+  <script src="feed.js"></script>
+  <script src="reports.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

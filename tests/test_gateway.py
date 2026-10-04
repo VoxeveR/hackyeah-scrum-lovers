@@ -79,33 +79,46 @@ def test_external_model_never_sees_raw_identifiers(policy_path, tmp_path):
 # ----------------------------------------------------------------- negative: blocked
 
 
+ATTACKER = "kyc-review@acme-corp.com"
+
+
+def test_system_one_hides_the_poisoned_page_before_the_model_reads_it(policy_path, tmp_path):
+    gw, stub, _, tools, _ = run_scenario(policy_path, tmp_path, "attack")
+    assert ATTACKER not in json.dumps(stub.seen)                     # the model never saw the injected instruction
+    assert all(m["to"] != ATTACKER for m in tools.outbox)          # so it did the user's task, not the attacker's
+    assert any(s["control"] == "S1-JEV-001" and s["action"] == "block"
+               for e in gw.audit.tail(20) for s in e["signals"])
+
+
 def test_injected_exfiltration_is_blocked_by_information_flow(policy_path, tmp_path):
+    # System One only flags the page for review here, so the model reads it: the deterministic rule is the floor
+    edit_policy(policy_path, lambda d: next(c for c in d["controls"] if c["id"] == "S1-JEV-001").update(block_at=0.99))
     gw, _, tracer, tools, final = run_scenario(policy_path, tmp_path, "attack")
     assert tools.outbox == []
     assert "IFC-TRIFECTA-001" in final
     last = gw.audit.tail(1)[0]
     assert last["decision"] == "block"
-    assert any(s["control"] == "IFC-TRIFECTA-001" and s["enforced"] for s in last["signals"])
+    assert any(s["control"] == "IFC-TRIFECTA-001" and s["action"] == "block" for s in last["signals"])
 
 
-def test_exfiltration_still_blocked_with_every_heuristic_and_jev_off(policy_path, tmp_path):
+def test_exfiltration_still_blocked_with_every_heuristic_and_jev_removed(policy_path, tmp_path):
     def off(doc):
-        for c in doc["controls"]:
-            if c["id"] in ("INJ-LEX-001", "S1-JEV-001", "S1-JEV-002"):
-                c["mode"] = "off"
+        doc["controls"] = [c for c in doc["controls"] if c["id"] not in ("INJ-LEX-001", "S1-JEV-001", "S1-JEV-002")]
         doc["systemone"]["backend"] = "off"
     edit_policy(policy_path, off)
     _, _, _, tools, final = run_scenario(policy_path, tmp_path, "attack")
     assert tools.outbox == [] and "IFC-TRIFECTA-001" in final
 
 
-def test_invariant_cannot_be_disabled_by_profile_or_mode(policy_path, tmp_path):
-    def weaken(doc):
-        doc["meta"]["active_profile"] = "dev"  # everything else becomes monitor-only
-        next(c for c in doc["controls"] if c["id"] == "IFC-TRIFECTA-001")["mode"] = "off"
-    edit_policy(policy_path, weaken)
-    _, _, _, tools, final = run_scenario(policy_path, tmp_path, "attack")
-    assert tools.outbox == [] and "IFC-TRIFECTA-001" in final
+def test_modes_are_gone_and_a_leftover_mode_is_rejected_with_a_reason(policy_path, tmp_path):
+    gw, _, _, http = make(policy_path, tmp_path)
+    rev = gw.store.get().rev
+    edit_policy(policy_path, lambda d: next(c for c in d["controls"] if c["id"] == "IFC-TRIFECTA-001").update(mode="off"))
+    assert gw.store.get().rev == rev and "delete it from the file" in gw.store.last_error  # old version keeps enforcing
+    client = AsyncOpenAI(base_url="http://gw/v1", api_key="spire-demo-kyc", http_client=http)
+    tools = DemoTools(scenario="attack")
+    asyncio.run(run_agent(client, "stub-model", tools, Console(quiet=True)))
+    assert all(m["to"] != ATTACKER for m in tools.outbox)          # the old version still protects
 
 
 def test_removing_an_invariant_is_rejected_and_last_good_policy_stays(policy_path, tmp_path):
@@ -142,7 +155,7 @@ def test_cel_error_fails_closed(policy_path, tmp_path):
                                 "phase": "tool_call", "when": "args.no_such_field > 5", "action": "allow"})
     edit_policy(policy_path, bad_condition)
     _, _, _, tools, final = run_scenario(policy_path, tmp_path, "benign")
-    assert tools.outbox == [] and "BROKEN-001" in final  # standard profile: on_eval_error = block
+    assert tools.outbox == [] and "BROKEN-001" in final  # a CEL error blocks (fail-closed)
 
 
 def test_unknown_agent_key_is_rejected(policy_path, tmp_path):
@@ -202,6 +215,6 @@ def test_duplicate_control_id_is_rejected(policy_path, tmp_path):
 
 def test_identifiers_rule_needs_known_kinds(policy_path, tmp_path):
     gw, _, _, _ = make(policy_path, tmp_path)
-    edit_policy(policy_path, lambda d: next(c for c in d["controls"] if c["id"] == "PII-PESEL-001").update(kinds=["NIP"]))
+    edit_policy(policy_path, lambda d: next(c for c in d["controls"] if c["id"] == "PII-PESEL-001").update(kinds=["DOWOD_OSOBISTY"]))
     gw.store.get()
     assert "unknown kinds" in gw.store.last_error

@@ -26,11 +26,11 @@ class OpenAIUpstream:
         try:
             r = await self._http.post(self.url, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=120)
         except httpx.HTTPError as e:
-            return 502, _error(f"SpireGate: OpenAI niedostępne ({type(e).__name__})", "upstream_error"), _ms(t)
+            return 502, _error(f"SpireGate: OpenAI unreachable ({type(e).__name__})", "upstream_error"), _ms(t)
         try:
             payload = r.json()
         except ValueError:
-            payload = _error(f"SpireGate: OpenAI zwróciło HTTP {r.status_code} bez JSON", "upstream_error")
+            payload = _error(f"SpireGate: OpenAI returned HTTP {r.status_code} without JSON", "upstream_error")
         return r.status_code, payload, _ms(t)
 
 
@@ -76,6 +76,9 @@ class StubUpstream:
             return _call(len(messages), "crm_get_client", {"client_id": "ACME-001"})
         if "web_fetch" not in called and re.search(r"wiadomo|news|internet", user, re.I):
             return _call(len(messages), "web_fetch", {"url": "https://news.example.com/acme"})
+        retries = sum(1 for n in names_by_id.values() if n == "web_fetch")
+        if "spróbuj ponownie" in results.get("web_fetch", "") and retries < 12:
+            return _call(len(messages), "web_fetch", {"url": "https://news.example.com/acme"})  # retries blindly
         if "send_email" not in called:
             injected = re.search(r"(?:wyślij|send|prześlij|forward)[^@]{0,120}?([\w.+-]+@[\w-]+(?:\.[\w-]+)+)",
                                  results.get("web_fetch", ""), re.I)

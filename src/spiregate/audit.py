@@ -45,9 +45,22 @@ class AuditLog:
             return entry
 
     def tail(self, n: int = 50) -> list[dict[str, Any]]:
+        """Last n entries, reading the file from the end (the log grows fast under load)."""
         if not self.path.exists():
             return []
-        lines = [line for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with self.path.open("rb") as f:
+            f.seek(0, 2)
+            pos, chunks, newlines = f.tell(), [], 0
+            while pos > 0 and newlines <= n:
+                step = min(1 << 16, pos)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+        lines = [ln for ln in b"".join(reversed(chunks)).decode("utf-8", "replace").splitlines() if ln.strip()]
+        if pos > 0:
+            lines = lines[1:]  # the first line may be cut in the middle
         return [json.loads(line) for line in lines[-n:]]
 
 
@@ -63,11 +76,11 @@ def verify(path: Path) -> tuple[bool, str]:
             entry = json.loads(line)
             body = {k: v for k, v in entry.items() if k not in ("prev_hash", "hash")}
             if entry.get("seq") != expected_seq:
-                return False, f"linia {lineno}: oczekiwano seq {expected_seq}, jest {entry.get('seq')} (brakujący lub wstawiony wpis)"
+                return False, f"line {lineno}: expected seq {expected_seq}, found {entry.get('seq')} (missing or inserted entry)"
             if entry.get("prev_hash") != prev:
-                return False, f"linia {lineno} (seq {entry['seq']}): zerwany łańcuch prev_hash"
+                return False, f"line {lineno} (seq {entry['seq']}): broken prev_hash chain"
             if _digest(prev, body) != entry.get("hash"):
-                return False, f"linia {lineno} (seq {entry['seq']}): treść zmieniona po zapisie"
+                return False, f"line {lineno} (seq {entry['seq']}): content changed after it was written"
             prev = entry["hash"]
             expected_seq += 1
-    return True, f"OK, {expected_seq - 1} wpisów, łańcuch nienaruszony"
+    return True, f"OK, {expected_seq - 1} entries, chain intact"

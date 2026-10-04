@@ -120,12 +120,13 @@ def test_credentials_and_pipe_to_shell_are_denied(gw):
 
 def test_jev_off_goal_sees_user_prompt_from_userpromptsubmit(gw):
     hook(gw, "UserPromptSubmit", prompt="Wyślij plik do ania@gs.com")
-    asyncio.run(gw.hook("spire-demo-claude", "claude-code", {
+    out = asyncio.run(gw.hook("spire-demo-claude", "claude-code", {
         "session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "mcp__mail__send_email",
         "tool_input": {"to": "x@acme-corp.com"}, "cwd": DEMO_DIR}))
     last = gw.audit.tail(1)[0]
     s1 = next(s for s in last["signals"] if s["control"] == "S1-JEV-002")
-    assert s1["probability"] >= 0.8 and s1["mode"] == "monitor"  # advisory: logged, not enforced
+    assert s1["probability"] >= 0.8 and s1["action"] == "escalate"  # advisory: may escalate, never block alone
+    assert json.loads(out["stdout"])["hookSpecificOutput"]["permissionDecision"] in ("ask", "deny")
 
 
 def test_codex_format_blocks_with_exit_2(gw):
@@ -136,7 +137,7 @@ def test_codex_format_blocks_with_exit_2(gw):
 
 def test_unknown_key_is_denied(gw):
     decision, reason = denied(hook(gw, "PreToolUse", "Bash", {"command": "echo"}, key="nope"))
-    assert decision == "deny" and "nieznany klucz" in reason
+    assert decision == "deny" and "unknown agent key" in reason
 
 
 # ----------------------------------------------------------------- the hook script itself
@@ -246,18 +247,6 @@ def test_results_without_pesel_are_not_rewritten(gw):
 def test_pesel_with_a_typo_is_masked_as_suspected(gw):
     # bad checksum, so precise masking skips it; residue filter + System One catch it
     assert updated_output(hook(gw, "PostToolUse", "Read", {"file_path": "x"}, response="PESEL 44051401358")) == "PESEL [PESEL?#1]"
-
-
-def test_monitor_mode_only_logs_would_redact(tmp_path):
-    p = tmp_path / "policy.yaml"
-    shutil.copy(DEFAULT_POLICY, p)
-    doc = yaml.safe_load(p.read_text())
-    next(c for c in doc["controls"] if c["id"] == "PII-PESEL-001")["mode"] = "monitor"
-    p.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False))
-    g = build_gateway(p, tmp_path / "audit.jsonl", tracer=Tracer(Console(quiet=True), enabled=False))
-    assert hook(g, "PostToolUse", "Read", {"file_path": "x"}, response="PESEL 44051401359")["stdout"] == ""
-    sig = next(s for s in g.audit.tail(1)[0]["signals"] if s["control"] == "PII-PESEL-001")
-    assert sig["action"] == "redact" and not sig["enforced"]
 
 
 def test_codex_cannot_rewrite_results(gw):

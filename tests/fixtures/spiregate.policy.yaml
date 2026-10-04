@@ -1,3 +1,6 @@
+# Pinned copy of policy/spiregate.policy.yaml for the test suite. The live file is edited from the dashboard,
+# so tests never read it. Update this copy when the default policy changes on purpose.
+#
 # spiregate.policy.yaml — the single source of truth for SpireGate.
 #
 # The file is re-read on every request if it changed on disk (no restart).
@@ -27,7 +30,7 @@
 apiVersion: spiregate.policy/v1
 
 meta:
-  policy_rev: 32
+  policy_rev: 31
   owner: ai-controls
 
 org:
@@ -167,7 +170,7 @@ analyst:
   model: gpt-5-mini
   every_requests: 200
   daily_report_at: "18:00"
-  max_usd_per_day: 50.0
+  max_usd_per_day: 1.0
 
 controls:
   - id: ACC-TOOL-001
@@ -313,31 +316,3 @@ controls:
     action: block
     min_severity: medium
     # exclude: [SIG-MD-EXFIL-001]
-
-  - id: MASK-001
-    title: 'The agent never sees: PESEL, IBAN, REGON, SSN'
-    phase: tool_result
-    detector: identifiers
-    kinds: [PESEL, IBAN, REGON, SSN]
-    action: redact
-    verify:
-      question: Czy ten tekst nadal zawiera PESEL, IBAN, REGON, SSN (USA) albo jego część?
-      positive: PESEL, IBAN, REGON, SSN (USA) w dowolnej formie, np. z odstępami, zapisany słownie, częściowo podany albo zakodowany
-      negative: brak takich danych; znaczniki w nawiasach kwadratowych są już zamaskowane i się nie liczą; numery zamówień, faktur i telefonów się nie liczą
-      threshold: 0.7
-      on_fail: withhold
-    template: mask_identifiers
-    params:
-      kinds: [PESEL, IBAN, REGON, SSN]
-      verify: true
-
-  - id: RULE-001
-    title: agent nie moze widziec imion
-    phase: tool_call
-    detector: systemone_rule
-    rule: agent nie moze widziec imion
-    action: escalate
-    authority: semantic
-    escalate_at: 0.75
-    template: prose_rule
-    params: {text: agent nie moze widziec imion, action: escalate}

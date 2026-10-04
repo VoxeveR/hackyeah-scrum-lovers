@@ -1,4 +1,5 @@
-from spiregate.detectors import Redactor, canonicalize, find_identifiers, injection_hits, is_internal, recipient_matches
+from spiregate.detectors import (Redactor, canonicalize, find_identifiers, injection_hits, is_internal, recipient_matches,
+                                 residue_hints)
 
 
 def kinds(text):
@@ -51,3 +52,10 @@ def test_recipient_rules():
     assert not recipient_matches("ania@gs.com.evil.io", ["*@gs.com"])
     assert is_internal("ania@gs.com", ["gs.com"])
     assert not is_internal("kyc-review@acme-corp.com", ["gs.com"])
+
+
+def test_keyword_hint_stays_on_its_own_line():
+    # a masked PESEL followed by an IBAN on the next line: the IBAN digits are not a suspected PESEL
+    text = "Beneficjent: Jan Nowak, PESEL [PESEL#1]\nIBAN: PL61 1090 1014 0000 0712 1981 2874"
+    assert residue_hints(text, {"PESEL"}) == []
+    assert residue_hints("PESEL: 440 514 013 59", {"PESEL"})  # same line still counts

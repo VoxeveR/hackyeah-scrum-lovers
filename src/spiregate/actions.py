@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,38 @@ _CREDENTIAL_MARKER = re.compile(
     r"(?:^|[\s'\"=:(/~}])\.(?:aws|ssh|gnupg|kube|docker|azure|oci)\b|\.config/gcloud\b"
     r"|\b(?:id_rsa|id_ed25519|id_ecdsa|\.netrc|\.git-credentials|\.pypirc|\.vault-token)\b")
 _GLOB_CHARS = re.compile(r"[*?\[]")
+
+# Opt-in facts for rules from the catalog: each is a plain boolean or number the policy can test in CEL.
+_DESTRUCTIVE = re.compile(
+    r"\brm\s+(?:-[a-zA-Z]*[rRf][a-zA-Z]*\s+)+|\bgit\s+push\b[^;&|]*\s(?:--force(?:-with-lease)?|-f)\b"
+    r"|\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[a-zA-Z]*f|\b(?:drop|truncate)\s+(?:table|database|schema)\b"
+    r"|\bmkfs\b|\bdd\s+if=|\bshred\b|\bkubectl\s+delete\b|\bterraform\s+destroy\b|\bhelm\s+uninstall\b", re.I)
+_PRIVILEGE = re.compile(
+    r"(?:^|[\s;&|(])(?:sudo|doas|su)\b|\bchmod\s+(?:-R\s+)?(?:[0-7]*[4-7][0-7]{3}|[ugoa]*\+s|777)\b|\bchown\s+(?:-R\s+)?root\b"
+    r"|\bsetcap\b|\bvisudo\b")
+_PACKAGE_INSTALL = re.compile(
+    r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+install\b|\b(?:uv|poetry|pdm)\s+add\b|\bnpm\s+(?:i|install|add)\b"
+    r"|\b(?:yarn|pnpm)\s+(?:add|install)\b|\bbrew\s+install\b|\bapt(?:-get)?\s+install\b|\bgem\s+install\b"
+    r"|\bcargo\s+install\b|\bgo\s+install\b|\bconda\s+install\b", re.I)
+_AMOUNT_KEYS = ("amount", "value", "kwota", "total", "sum", "suma")
+
+
+def _amount(args: dict[str, Any]) -> float:
+    """The amount of a payment-like action, 0.0 when there is none ("18 450,00" and 18450.0 both work)."""
+    for k in _AMOUNT_KEYS:
+        v = args.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            digits = re.sub(r"[^\d,.-]", "", v).replace(",", ".")
+            if digits.count(".") > 1:   # 18.450.00 -> thousands separators
+                head, _, tail = digits.rpartition(".")
+                digits = head.replace(".", "") + "." + tail
+            try:
+                return float(digits)
+            except ValueError:
+                continue
+    return 0.0
 
 
 @dataclass
@@ -124,6 +157,7 @@ def compute_facts(name: str, spec: dict[str, Any], args: dict[str, Any], *, allo
     resolved = [_resolve(p, cwd) for p in raw_paths]
     cred_dirs = [os.path.realpath(os.path.expanduser(d)) for d in CREDENTIAL_DIRS]
     command = _command_of(args) if name in SHELL_TOOLS else ""
+    now = datetime.now()
     touches_credentials = (any(_under(r, d) for r in resolved for d in cred_dirs)
                            or any(fnmatch.fnmatch(r, g) for r in resolved for g in CREDENTIAL_GLOBS)
                            or bool(command and _CREDENTIAL_MARKER.search(command)))
@@ -136,6 +170,13 @@ def compute_facts(name: str, spec: dict[str, Any], args: dict[str, Any], *, allo
         "pipe_to_shell": pipe,
         "touches_protected": kills or any(_under(r, root) for r in resolved for root in protected_roots),
         "touches_credentials": touches_credentials,
+        "destructive": effective.get("effect") == "delete" or bool(command and _DESTRUCTIVE.search(command)),
+        "privilege_escalation": bool(command and _PRIVILEGE.search(command)),
+        "package_install": bool(command and _PACKAGE_INSTALL.search(command)),
+        "amount": _amount(args),
+        "recipient_count": len(dests),
+        "hour": now.hour,
+        "weekday": now.weekday(),   # 0 = Monday, 5-6 = weekend
     }
     return effective, facts
 
@@ -149,5 +190,6 @@ def output_is_untrusted(name: str, spec: dict[str, Any], args: dict[str, Any]) -
 
 def protected_roots(repo_root: Path, extra: list[str]) -> list[str]:
     base = [repo_root / "policy", repo_root / ".env", repo_root / "var", repo_root / "hooks",
-            repo_root / "src", repo_root / "demo" / "claude-code" / ".claude"]
+            repo_root / "src", repo_root / "demo" / "claude-code" / ".claude",
+            repo_root / "feed"]   # signed signature feed and its demo key
     return [os.path.realpath(p) for p in base] + [os.path.realpath(os.path.expanduser(p)) for p in extra]

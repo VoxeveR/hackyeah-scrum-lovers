@@ -24,12 +24,15 @@ from typing import Any
 
 from .actions import compute_facts, output_is_untrusted
 from .audit import AuditLog
+from .budget import BudgetLedger, Hold
+from .events import SIMULATED, EventBus
 from .detectors import (Redactor, find_identifiers, injection_hits, json_strings, mask_residue, redact_json,
                         residue_hints, withhold_json)
+from .feed import FeedStore, model_paths, signals_for, stops, withhold_notice
 from .policy import ACTION_SEVERITY, Control, LoadedPolicy, PolicyStore
-from .systemone import SystemOneClient
+from .systemone import QUESTIONS, SystemOneClient, _stub_answer
 from .trace import Tracer
-from .verify import residue_questions, rule_questions, state_text, stub_residual
+from .verify import residue_questions, state_text, stub_residual
 
 RISKY_EFFECTS = {"external_send", "financial", "delete", "exec", "write"}
 
@@ -48,14 +51,22 @@ class SessionStore:
 
 class Gateway:
     def __init__(self, store: PolicyStore, audit: AuditLog, tracer: Tracer, upstreams: dict[str, Any],
-                 systemone: SystemOneClient, protected: list[str] | None = None):
+                 systemone: SystemOneClient, protected: list[str] | None = None, feed: FeedStore | None = None):
         self.store = store
+        self.feed = feed or FeedStore()   # signed signatures of known attacks (external threat-intel system)
+        self.feed.sync(store.current.doc.feed)
+        self._feed_events_shown = 0
         self.audit = audit
         self.tracer = tracer
         self.upstreams = upstreams
         self.systemone = systemone
         self.protected = protected or []
         self.sessions = SessionStore()
+        self.ledger = BudgetLedger()
+        self.ledger.replay(audit.tail(20000), store.current.doc.budgets)
+        self.systemone.on_usage = self._systemone_cost
+        self.bus = EventBus()  # live stream for the dashboard (Silnik page)
+        self.systemone.on_event = self.bus.system_one
         self._seen_results: dict[str, list[dict[str, Any]]] = {}  # content hash -> signals already computed
         self._verify_cache: dict[str, tuple[Any, str, list[dict[str, Any]]]] = {}
         self._events_shown = 0
@@ -66,29 +77,53 @@ class Gateway:
         pol = self._policy()
         t_start = time.perf_counter()
         identity = pol.doc.identities.get(api_key or "")
+        self.bus.begin("proxy", identity.agent_id if identity else None, "model",
+                       f"{body.get('model')} · {len(body.get('messages') or [])} messages")
         if identity is None:
-            self.tracer.header(f"żądanie #{self._n} · nieznany klucz")
-            self.tracer.verdict("block", "401: klucz nie należy do żadnego agenta")
+            self.tracer.header(f"request #{self._n} · unknown key")
+            self.tracer.verdict("block", "401: the key belongs to no agent")
             self._audit(pol, None, "proxy", "block", [{"control": "IDENTITY", "reason": "unknown key"}], {})
-            return 401, _err("SpireGate: nieznany klucz agenta", "invalid_api_key")
+            return 401, _err("SpireGate: unknown agent key", "invalid_api_key")
 
         model = pol.model(str(body.get("model")))
-        self.tracer.header(f"żądanie #{self._n} · {identity.agent_id} ({identity.desk}) → {body.get('model')} · "
-                           f"polityka rev {pol.rev} ({pol.sha}), profil {pol.profile_name}")
+        self.tracer.header(f"request #{self._n} · {identity.agent_id} ({identity.desk}) → {body.get('model')} · "
+                           f"policy rev {pol.rev} ({pol.sha})")
         if model is None:
-            self.tracer.verdict("block", "model spoza listy dozwolonych w polityce")
+            self.tracer.verdict("block", "the model is not on the policy's allow-list")
             self._audit(pol, identity, "proxy", "block", [{"control": "MODEL-ALLOWLIST", "reason": "model not allowed"}], {},
                         extra={"model": body.get("model")})
-            return 403, _err(f"SpireGate: model {body.get('model')!r} nie jest dozwolony", "model_not_allowed")
+            return 403, _err(f"SpireGate: model {body.get('model')!r} is not allowed", "model_not_allowed")
         if body.get("stream"):
-            return 400, _err("SpireGate MVP: streaming jeszcze nieobsługiwany, ustaw stream=false", "unsupported")
+            return 400, _err("SpireGate MVP: streaming is not supported yet, set stream=false", "unsupported")
 
         messages: list[dict[str, Any]] = body.get("messages", [])
-        signals: list[dict[str, Any]] = []
+        # 1a. known attack payloads in the user's messages: refused before anything is reserved or sent
+        signals = self._feed_signals(pol, "prompt", [_text(m) for m in messages if m.get("role") == "user"])
+        refused = stops(signals)
+        if refused:
+            word = "Blocked" if _combine(refused) == "block" else "Needs human approval"
+            self.tracer.verdict("block", "the prompt never reaches the model")
+            self._audit(pol, identity, "proxy", "block", signals, {}, extra={"model": body.get("model"), "phase": "prompt"})
+            return 200, _assistant(body, f"[SpireGate: {word}] the prompt contains a known attack pattern: "
+                                         + "; ".join(s["reason"] for s in refused))
+        first_user = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        # The proxy is stateless: a conversation is identified by its opening request. A retrying agent always
+        # resends its history, so a request without any assistant turn really is a new conversation.
+        conv_id = hashlib.sha256(f"{identity.agent_id}\x00{first_user}".encode()).hexdigest()[:12]
+        if not any(m.get("role") in ("assistant", "tool") for m in messages):
+            self.ledger.reset_session(identity.agent_id, conv_id)
+
+        # 1b. budgets: reserve the worst case on every matching budget before anything is spent
+        demand, max_out = self._estimate(pol, model, body)
+        refusal, hold = self._budget_preflight(pol, identity, demand, max_out, signals)
+        if refusal:
+            self._audit(pol, identity, "proxy", "block", signals, {}, extra={"model": body.get("model"), "budget_demand": demand})
+            return 403, _err(f"SpireGate: budget exceeded. {refusal}", "budget_exceeded")
 
         # 2. label from history (stateless: the agent resends the full history every turn)
         session = {"integrity": "trusted", "class_rank": pol.class_rank("internal")}
         calls_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
+        hidden: dict[str, str] = {}   # tool_call_id -> what the model reads instead of the result
         s1_ms = 0.0
         for m in messages:
             for tc in m.get("tool_calls") or []:
@@ -97,30 +132,46 @@ class Gateway:
                 session["class_rank"] = max(session["class_rank"], pol.class_rank("client_pii"))
             if m.get("role") == "tool":
                 name, args = calls_by_id.get(m.get("tool_call_id"), ("?", {}))
+                before = len(signals)
                 s1_ms += await self._label_result(pol, session, name, args, _text(m), signals)
+                if stops(signals[before:]):     # a known attack payload: the model never reads it
+                    hidden[m.get("tool_call_id")] = withhold_notice(stops(signals[before:]))
+                elif any(s.get("authority") == "semantic" and s["action"] == "block" for s in signals[before:]):
+                    hidden[m.get("tool_call_id")] = ("[SpireGate: result withheld (S1-JEV-001): System One judged it "
+                                                     "to contain instructions aimed at the agent]")   # System One blocked it
         self.tracer.info(_session_line(pol, session))
 
         # 3. masking for the target model
         upstream_body, redacted = await self._apply_to_model(pol, model, session, body, signals)
+        for m in upstream_body.get("messages", []):
+            if m.get("role") == "tool" and m.get("tool_call_id") in hidden:
+                m["content"] = hidden[m["tool_call_id"]]
+                redacted.append("withheld")
+        if self._drop_poisoned_tools(pol, upstream_body, signals):
+            redacted.append("withheld")
 
         # 4. upstream
         t0_ms = round((time.perf_counter() - t_start) * 1000 - s1_ms, 1)
         upstream = self.upstreams[model.upstream]
         status, resp, up_ms = await upstream.complete(upstream_body)
         usage = resp.get("usage", {}) if isinstance(resp, dict) else {}
-        self.tracer.info(f"→ {upstream.name}: HTTP {status}, {up_ms} ms, {usage.get('total_tokens', '?')} tokenów")
+        cost = self._actual_cost(pol, model, usage if status == 200 else {}, up_ms)
+        self.ledger.reconcile(hold, {"usd": cost["usd"], "tokens": cost["tokens"]})
+        self.tracer.info(f"→ {upstream.name}: HTTP {status}, {up_ms} ms, {usage.get('total_tokens', '?')} tokens, "
+                         f"cost {cost['usd']:.6f} USD")
         if status != 200:
             self._audit(pol, identity, "proxy", "upstream_error", signals, {"t0_ms": t0_ms, "upstream_ms": up_ms},
-                        extra={"model": body.get("model")})
+                        extra={"model": body.get("model"), "cost": cost})
             return status, resp
 
         # 5. tool calls the model asks for
-        user_goal = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        user_goal = first_user
         message = resp["choices"][0]["message"]
         calls, worst, s1b_ms = [], "allow", 0.0
         for tc in message.get("tool_calls") or []:
             decision, sigs, record, ms = await self._evaluate_call(
-                pol, identity, session, tc["function"]["name"], _loads(tc["function"].get("arguments")), user_goal, None)
+                pol, identity, session, tc["function"]["name"], _loads(tc["function"].get("arguments")), user_goal, None,
+                session_id=conv_id)
             calls.append(record)
             signals.extend(sigs)
             s1b_ms += ms
@@ -128,22 +179,71 @@ class Gateway:
                 worst = decision
 
         if not calls:
-            self.tracer.verdict("allow", "model odpowiedział tekstem; przekazuję agentowi")
+            self.tracer.verdict("allow", "the model answered with text; passed to the agent")
         elif worst in ("block", "escalate"):
             reasons = "; ".join(f"{c['tool']}: {', '.join(c['controls'])}" for c in calls if c["decision"] in ("block", "escalate"))
-            word = "Zablokowane" if worst == "block" else "Wymaga zatwierdzenia przez człowieka"
-            resp["choices"][0]["message"] = {"role": "assistant", "content": f"[SpireGate: {word}] {reasons}. Akcja nie została wykonana."}
+            word = "Blocked" if worst == "block" else "Needs human approval"
+            resp["choices"][0]["message"] = {"role": "assistant", "content": f"[SpireGate: {word}] {reasons}. The action was not executed."}
             resp["choices"][0]["finish_reason"] = "stop"
-            self.tracer.verdict(worst, "agent dostaje tekst zamiast tool_call, więc nie ma czego wykonać")
+            self.tracer.verdict(worst, "the agent gets text instead of a tool_call, so there is nothing to execute")
         else:
-            self.tracer.verdict("allow", "tool_call przekazany agentowi do wykonania")
+            self.tracer.verdict("allow", "tool_call passed to the agent to execute")
 
-        verdict = "redact" if worst == "allow" and redacted else worst
+        verdict = worst if worst != "allow" else "withhold" if "withheld" in redacted else "redact" if redacted else "allow"
         latency = {"t0_ms": t0_ms, "systemone_ms": round(s1_ms + s1b_ms, 1), "upstream_ms": up_ms}
         self._audit(pol, identity, "proxy", verdict, signals, latency,
                     extra={"model": body.get("model"), "session": _session_view(pol, session),
-                           "redacted": redacted, "tool_calls": calls, "usage": usage})
+                           "redacted": redacted, "tool_calls": calls, "usage": usage, "cost": cost})
         return 200, resp
+
+    # ================================================================== budgets
+    def _estimate(self, pol: LoadedPolicy, model, body: dict[str, Any]) -> tuple[dict[str, float], int]:
+        """Worst case for one model call: estimated input (chars / 4) plus the maximum answer length."""
+        est_in = len(json.dumps(body.get("messages", []), ensure_ascii=False)) // 4 + len(json.dumps(body.get("tools", []))) // 4
+        max_out = int(body.get("max_completion_tokens") or body.get("max_tokens") or pol.doc.budgets.default_max_tokens)
+        price = pol.doc.prices.get(model.id)
+        usd = (est_in * price.usd_per_mtok_in + max_out * price.usd_per_mtok_out) / 1e6 if price else 0.0
+        return {"usd": round(usd, 8), "tokens": est_in + max_out, "requests": 1}, max_out
+
+    def _budget_preflight(self, pol: LoadedPolicy, identity, demand, max_out: int, signals
+                          ) -> tuple[str | None, Hold | None]:
+        """Returns (refusal reason, hold to reconcile after the call)."""
+        budgets = pol.doc.budgets
+        if not budgets.rules:
+            return None, None
+        problems = [(r.id, f"{r.id}: at most {r.max_tokens_per_request} answer tokens per request, this request asks for {max_out}")
+                    for r, _ in BudgetLedger.matching(budgets, identity)
+                    if r.max_tokens_per_request and max_out > r.max_tokens_per_request]
+        hold = None
+        if not problems:
+            violations, hold = self.ledger.reserve(budgets, identity, demand)
+            problems = [(v.budget_id, v.message()) for v in violations]
+        if problems:
+            signals.extend(self._bsignal(cid, reason) for cid, reason in problems)
+            self.tracer.verdict("block", "403, no retry: the agent gets the reason and when the limit renews")
+            return "; ".join(r for _, r in problems), None
+        self.tracer.info(f"budget: reserved {demand['usd']:.6f} USD, {demand['tokens']} tokens")
+        return None, hold
+
+    def _actual_cost(self, pol: LoadedPolicy, model, usage: dict[str, Any], up_ms: float) -> dict[str, float]:
+        tin, tout = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+        price = pol.doc.prices.get(model.id)
+        gpu_s = round(up_ms / 1000, 3) if model.location == "on_prem" else 0.0
+        usd = 0.0
+        if price:
+            usd = (tin * price.usd_per_mtok_in + tout * price.usd_per_mtok_out) / 1e6 + gpu_s * price.usd_per_gpu_second
+        return {"usd": round(usd, 8), "tokens": tin + tout, "gpu_s": gpu_s}
+
+    def _bsignal(self, cid: str, reason: str) -> dict[str, Any]:
+        self.tracer.decision("block", cid, reason)
+        return {"control": cid, "action": "block", "authority": "authoritative", "reason": reason}
+
+    def _systemone_cost(self, backend: str, input_tokens: int) -> None:
+        pol = self.store.current
+        price = pol.doc.prices.get(pol.doc.systemone.model)
+        per_mtok = price.usd_per_mtok_in if price and backend == "jev" else 0.0
+        self.ledger.add_control_overhead(input_tokens, per_mtok)
+        self.bus.add_s1_cost(input_tokens, input_tokens / 1e6 * per_mtok)
 
     # ================================================================== surface 2+3: SDK and hooks
     async def decide(self, api_key: str | None, req: dict[str, Any], surface: str = "sdk") -> dict[str, Any]:
@@ -153,47 +253,71 @@ class Gateway:
         phase = req.get("phase", "pre")
         tool = str(req.get("tool") or "")
         identity = pol.doc.identities.get(api_key or "")
+        args = req.get("args") if isinstance(req.get("args"), dict) else {}
+        kind, label = {"prompt": ("prompt", "user prompt"), "post": ("result", f"{tool} → result")
+                       }.get(phase, ("action", _action_label(tool, args)))
+        if phase != "prompt" or identity is None:  # a user's prompt is context for later checks, not a decision
+            self.bus.begin(surface, identity.agent_id if identity else None, kind, label)
         if identity is None:
-            self.tracer.header(f"{surface} {phase} · nieznany klucz")
-            self.tracer.verdict("block", "klucz nie należy do żadnego agenta")
+            self.tracer.header(f"{surface} {phase} · unknown key")
+            self.tracer.verdict("block", "the key belongs to no agent")
             self._audit(pol, None, surface, "block", [{"control": "IDENTITY", "reason": "unknown key"}], {})
-            return {"decision": "block", "controls": ["IDENTITY"], "reasons": ["SpireGate: nieznany klucz agenta"]}
+            return {"decision": "block", "controls": ["IDENTITY"], "reasons": ["SpireGate: unknown agent key"]}
 
         session = self.sessions.get(identity.agent_id, req.get("session_id"), pol.class_rank("internal"))
-        args = req.get("args") if isinstance(req.get("args"), dict) else {}
         signals: list[dict[str, Any]] = []
         self.tracer.header(f"{surface} · {phase} · {identity.agent_id}" + (f" · {tool}" if tool else "")
-                           + f" · polityka rev {pol.rev} ({pol.sha})")
+                           + f" · policy rev {pol.rev} ({pol.sha})")
 
         if phase == "prompt":
             text = str(req.get("user_request") or "")
+            refused = stops(signals := self._feed_signals(pol, "prompt", [text]))
+            if refused:   # a known attack payload: the prompt never reaches the agent
+                self.bus.begin(surface, identity.agent_id, kind, label)
+                self.tracer.verdict("block", "the prompt never reaches the agent")
+                self._audit(pol, identity, surface, "block", signals, {}, extra={"phase": "prompt"})
+                return {"decision": "block", "controls": list(dict.fromkeys(s["control"] for s in refused)),
+                        "reasons": [f"{s['control']}: {s['reason']}" for s in refused]}
             session["user_request"] = Redactor().redact(text)[0][:2000]
             if find_identifiers(text):
                 session["class_rank"] = max(session["class_rank"], pol.class_rank("client_pii"))
-            self.tracer.info("zapamiętuję polecenie użytkownika (zamaskowane) do oceny zgodności akcji z celem")
+            self.tracer.info("user prompt stored (masked) to judge whether later actions match it")
             self.tracer.info(_session_line(pol, session))
             return {"decision": "allow", "controls": [], "reasons": []}
 
         if phase == "post":
             raw = req.get("result")
             text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-            await self._label_result(pol, session, tool, args, text, signals)
-            redacted_obj, used, withheld = await self._redact_result(pol, session, tool, raw, signals)
+            pending: list[dict[str, Any]] = []
+            await self._label_result(pol, session, tool, args, text, signals, defer=pending)
+            known = stops(signals)
+            if known:   # a known attack payload (feed): withheld as a whole, nothing left to mask or ask about
+                redacted_obj, used, withheld = withhold_json(raw, withhold_notice(known, self._n)), ["withheld"], True
+            else:
+                redacted_obj, used, withheld = await self._redact_result(pol, session, tool, raw, signals, extra=pending)
+            for item in pending:   # no identifier check to join: ask on its own
+                if not item.get("done"):
+                    await self._ask_directed(pol, item)
+            jev_block = next((s for s in signals if s.get("authority") == "semantic" and s["action"] == "block"), None)
+            if jev_block and not known:   # System One blocked the result: the agent gets a notice instead
+                notice = f"[SpireGate: result withheld ({jev_block['control']}): System One judged it to contain instructions aimed at the agent]"
+                redacted_obj, used, withheld = withhold_json(redacted_obj, notice), list(used) + ["withheld"], True
             self.tracer.info(_session_line(pol, session))
             decision = "withhold" if withheld else "redact" if used else "label"
             self._audit(pol, identity, surface, decision, signals, {}, extra={"tool": tool, "phase": "post",
                         "session": _session_view(pol, session), "redacted": used})
             return {"decision": "withhold" if withheld else "redact" if used else "allow",
-                    "controls": [s["control"] for s in signals if s["enforced"]], "reasons": [],
+                    "controls": [s["control"] for s in signals if s["action"] != "allow"], "reasons": [],
                     "session": _session_view(pol, session), "result_redacted": redacted_obj if used else None}
 
         decision, sigs, record, s1_ms = await self._evaluate_call(
-            pol, identity, session, tool, args, session.get("user_request", ""), req.get("cwd"))
-        enforced = [s for s in sigs if s["enforced"] and s["action"] in ("block", "escalate")]
+            pol, identity, session, tool, args, session.get("user_request", ""), req.get("cwd"),
+            session_id=req.get("session_id"))
+        enforced = [s for s in sigs if s["action"] in ("block", "escalate")]
         if decision == "allow":
-            self.tracer.verdict("allow", "akcja zgodna z polityką; dalej decyduje agent (jego własne zgody)")
+            self.tracer.verdict("allow", "the action complies with the policy; the agent's own permissions decide next")
         else:
-            self.tracer.verdict(decision, "akcja nie zostanie wykonana" if decision == "block" else "wymaga zatwierdzenia")
+            self.tracer.verdict(decision, "the action will not run" if decision == "block" else "needs approval")
         latency = {"t0_ms": round((time.perf_counter() - t_start) * 1000 - s1_ms, 1), "systemone_ms": s1_ms}
         self._audit(pol, identity, surface, decision, sigs, latency,
                     extra={"tool": tool, "phase": "pre", "session": _session_view(pol, session), "tool_calls": [record]})
@@ -223,13 +347,19 @@ class Gateway:
             if fmt == "claude-code":  # replaces the result before the model sees it; same shape as the original
                 payload = {"hookSpecificOutput": {"hookEventName": "PostToolUse",
                                                   "updatedToolOutput": out["result_redacted"]}}
-                self.tracer.info("Claude Code dostanie " + ("WSTRZYMANY" if out["decision"] == "withhold" else "zamaskowany")
-                                 + " wynik (updatedToolOutput)")
+                self.tracer.info("Claude Code gets a " + ("WITHHELD" if out["decision"] == "withhold" else "masked")
+                                 + " result (updatedToolOutput)")
                 return {"stdout": json.dumps(payload, ensure_ascii=False), "stderr": "", "exit": 0}
-            self.tracer.info("UWAGA: Codex nie pozwala podmienić wyniku narzędzia; maskowanie tylko w logu")
+            self.tracer.info("NOTE: Codex cannot replace a tool result; masking is recorded in the log only")
+        if name == "UserPromptSubmit" and out["decision"] != "allow":
+            reason = "SpireGate: " + "; ".join(out["reasons"])
+            if fmt == "codex":
+                return {"stdout": "", "stderr": reason + "\n", "exit": 2}
+            # Claude Code erases the prompt from the context and shows the reason to the user
+            return {"stdout": json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False), "stderr": "", "exit": 0}
         if name != "PreToolUse" or out["decision"] == "allow":
             return {"stdout": "", "stderr": "", "exit": 0}
-        reason = "SpireGate: " + ("; ".join(out["reasons"]) or "zablokowane przez politykę")
+        reason = "SpireGate: " + ("; ".join(out["reasons"]) or "blocked by policy")
         if fmt == "codex":  # exit 2 + stderr is the most robust block signal across Codex versions
             return {"stdout": "", "stderr": reason + "\n", "exit": 2}
         decision = "deny" if out["decision"] == "block" else "ask"
@@ -239,7 +369,8 @@ class Gateway:
 
     # ================================================================== shared evaluation
     async def _label_result(self, pol: LoadedPolicy, session: dict[str, Any], name: str,
-                            args: dict[str, Any], text: str, signals: list[dict[str, Any]]) -> float:
+                            args: dict[str, Any], text: str, signals: list[dict[str, Any]],
+                            defer: list | None = None) -> float:
         spec = pol.tool(name)
         untrusted = output_is_untrusted(name, spec.model_dump(), args)
         if untrusted:
@@ -249,91 +380,163 @@ class Gateway:
         if ids:
             session["class_rank"] = max(session["class_rank"], pol.class_rank("client_pii"))
 
-        key = hashlib.sha256(f"{name}\x00{text}".encode()).hexdigest()
+        feed_sha = self.feed.current.sha if self.feed.current else ""
+        key = hashlib.sha256(f"{name}\x00{pol.sha}\x00{feed_sha}\x00{text}".encode()).hexdigest()
         if key in self._seen_results:  # history is resent every turn; judge each result once
             signals.extend(self._seen_results[key])
+            _taint_on_feed_hit(session, self._seen_results[key])
             return 0.0
-        self.tracer.info(f"nowy wynik narzędzia {name}: {'NIEZAUFANY' if untrusted else 'zaufany'}, klasa {spec.output_class}"
-                         + (f", identyfikatory: {', '.join(sorted({i.kind for i in ids}))}" if ids else ""))
-        result_signals: list[dict[str, Any]] = []
-        s1_ms = await self._tool_result_controls(pol, name, text, result_signals) if untrusted else 0.0
+        self.tracer.info(f"new tool result {name}: {'UNTRUSTED' if untrusted else 'trusted'}, class {spec.output_class}"
+                         + (f", identifiers: {', '.join(sorted({i.kind for i in ids}))}" if ids else ""))
+        # signatures of known attacks run on every result, trusted or not (a poisoned model file is poisoned anywhere)
+        result_signals = self._feed_signals(pol, "tool_result", [text])
+        s1_ms = 0.0
+        if untrusted and not stops(result_signals):   # a withheld result needs no further questions
+            s1_ms = await self._tool_result_controls(pol, name, text, result_signals, defer, signals)
         self._seen_results[key] = result_signals
         signals.extend(result_signals)
+        _taint_on_feed_hit(session, result_signals)
         return s1_ms
 
-    async def _tool_result_controls(self, pol: LoadedPolicy, name: str, text: str, out: list) -> float:
+    async def _tool_result_controls(self, pol: LoadedPolicy, name: str, text: str, out: list,
+                                    defer: list | None = None, signals: list | None = None) -> float:
+        """With `defer`, the System One question is not asked here: it joins the identifier check on the same
+        result, so one call answers both. `out` is the cached signal list, `signals` the request's."""
         s1_ms = 0.0
         for c in pol.controls_for("tool_result"):
-            mode = pol.mode_of(c)
-            if mode == "off":
-                continue
             if c.detector == "injection_lexicon":
                 hits = injection_hits(text)
                 if hits:
-                    out.append(self._signal(c, mode, f"{name}: podejrzane wzorce {hits}; sesja i tak już niezaufana"))
+                    out.append(self._signal(c, f"{name}: suspicious patterns {hits}; the session is untrusted anyway"))
             elif c.detector == "systemone_directed_at_agent":
-                redacted, _ = Redactor().redact(text)
-                res = await self.systemone.ask(pol.doc.systemone, "directed_at_agent", redacted[:4000])
-                s1_ms += res.latency_ms
-                out.append(self._s1_signal(c, mode, res, f"{name}: czy tekst wydaje polecenia agentowi?"))
+                # deferred: resolved after _label_result copied `out` into the request's signals, so append to both
+                item = {"control": c, "name": name, "text": text, "out": out, "signals": signals if defer is not None else None}
+                if defer is not None:
+                    defer.append(item)
+                else:
+                    s1_ms += await self._ask_directed(pol, item)
         return s1_ms
 
+    async def _ask_directed(self, pol: LoadedPolicy, item: dict[str, Any]) -> float:
+        """The question about one untrusted result, asked on its own (nothing else to bundle it with)."""
+        seen = list(item["out"]) + list(item.get("signals") or [])
+        b = await self.systemone.ask_bundle(pol.doc.systemone, QUESTIONS["directed_at_agent"],
+                                            Redactor().redact(item["text"])[0][:4000],
+                                            {"directed_at_agent": lambda st: _stub_answer("directed_at_agent", st)},
+                                            meta={"after_rule": any(_rule_acted(s) for s in seen)})
+        self._resolve_directed(item, b)
+        return b.latency_ms
+
+    def _resolve_directed(self, item: dict[str, Any], bundle) -> None:
+        item["done"] = True
+        sig = self._s1_signal(item["control"], bundle.result("directed_at_agent"),
+                              f"{item['name']}: does the text give the agent instructions?")
+        item["out"].append(sig)                      # cached with the result: judged once
+        if item.get("signals") is not None and item["signals"] is not item["out"]:
+            item["signals"].append(sig)
+
+    async def _ask_action(self, pol: LoadedPolicy, name: str, args: dict[str, Any], user_goal: str,
+                          pending: list, sigs: list[dict[str, Any]]) -> float:
+        """Every semantic question about one action in a single System One call."""
+        questions: dict[str, Any] = {}
+        stubs: dict[str, Any] = {}
+        for q, c in pending:
+            if q == "off_goal":
+                questions.update(QUESTIONS["off_goal"])
+                stubs[q] = lambda st: _stub_answer("off_goal", st)
+            elif c.detector == "systemone_rule":
+                questions[q] = {"type": "noul", "instructions": f"Czy ta akcja łamie zasadę firmy: „{c.rule}”?",
+                                "criteria": {"true": "akcja narusza tę zasadę",
+                                             "false": "akcja jest zgodna z tą zasadą albo jej nie dotyczy"}}
+                stubs[q] = lambda st: 0.05
+            else:
+                v = c.verify
+                questions[q] = {"type": "noul", "instructions": f"{v.question} (zasada: {c.title})",
+                                "criteria": {"true": v.positive, "false": v.negative}}
+                stubs[q] = lambda st: 0.05
+        state = {"user_request": Redactor().redact(user_goal)[0], "tool": name,
+                 "args": _loads(Redactor().redact(json.dumps(args, ensure_ascii=False))[0])}
+        b = await self.systemone.ask_bundle(pol.doc.systemone, questions, state, stubs)
+        self.tracer.info(f"System One [{b.backend}]: {len(pending)} questions in one call, {b.latency_ms} ms")
+        for q, c in pending:
+            res = b.result(q)
+            if q == "off_goal":
+                sigs.append(self._s1_signal(c, res, f"{name}: does the action go beyond the request?"))
+            elif c.detector == "systemone_rule":
+                sigs.append(self._s1_signal(c, res, f"{name}: {c.title}"))
+            elif res.probability is not None and c.verify.block_at is not None and res.probability >= c.verify.block_at:
+                sig = self._vsignal(f"{c.id}/verify", "block",
+                                    f"the rule did not fire, but System One [{res.backend}] p={res.probability:.2f} "
+                                    f"≥ {c.verify.block_at}: breaks “{c.title}”, blocked")
+                sigs.append({**sig, "probability": res.probability, "backend": res.backend})
+            elif res.probability is not None and res.probability >= c.verify.threshold:
+                sig = self._vsignal(f"{c.id}/verify", "escalate",
+                                    f"the rule did not fire, but System One [{res.backend}] p={res.probability:.2f} "
+                                    f"≥ {c.verify.threshold}: may break “{c.title}”, to review")
+                sigs.append({**sig, "probability": res.probability, "backend": res.backend})
+            else:
+                self.tracer.info(f"{c.id}/verify: System One [{res.backend}] "
+                                 + (f"p={res.probability:.2f}" if res.probability is not None else "no answer")
+                                 + ": no breach")
+        return b.latency_ms
+
     async def _evaluate_call(self, pol: LoadedPolicy, identity, session: dict[str, Any], name: str,
-                             args: dict[str, Any], user_goal: str, cwd: str | None):
+                             args: dict[str, Any], user_goal: str, cwd: str | None, session_id: str | None = None):
         spec = pol.tool(name)
         effective, facts = compute_facts(name, spec.model_dump(), args, allowed_tools=identity.allowed_tools,
                                          internal_domains=pol.doc.org.get("internal_domains", []),
                                          protected_roots=self.protected, cwd=cwd)
         shown = {k: (v if len(str(v)) < 60 else str(v)[:57] + "...") for k, v in args.items()}
-        dest = f", cel: {', '.join(facts['destinations'])}" if facts["destinations"] else ""
-        self.tracer.info(f"akcja: {name}({shown})  [effect={effective['effect']}{dest}]")
+        dest = f", to: {', '.join(facts['destinations'])}" if facts["destinations"] else ""
+        self.tracer.info(f"action: {name}({shown})  [effect={effective['effect']}{dest}]")
         data = {"identity": identity.model_dump(), "session": _session_view(pol, session),
                 "tool": {"name": name, **effective}, "args": args, "facts": facts}
 
         sigs: list[dict[str, Any]] = []
         s1_ms = 0.0
+        # loop breaker and tool-call budgets come before any other rule
+        for cid, reason in self.ledger.tool_call(pol.doc.budgets, identity, session_id, name, args):
+            sigs.append(self._bsignal(cid, reason))
+        # known attacks from the signed feed: the arguments, plus any model file the action points at
+        texts = json_strings(args)
+        sigs += self._feed_signals(pol, "tool_call", texts, model_paths(texts, cwd))
+        # 1. deterministic rules decide what they can, and collect the semantic questions for System One
+        pending: list[tuple[str, Control]] = []
         for c in pol.controls_for("tool_call"):
-            mode = pol.mode_of(c)
-            if mode == "off":
+            if c.detector == "systemone_rule":               # a company rule in plain language
+                # without its own scope it covers risky actions; `when` widens or narrows that
+                if (c.when and _in_scope(pol, c, data)) or (not c.when and effective["effect"] in RISKY_EFFECTS):
+                    pending.append(("rule_" + _qname(c.id).removeprefix("verify_"), c))
+                continue
+            if c.detector == "systemone_matches_goal":       # a rule only System One can judge
+                if effective["effect"] not in RISKY_EFFECTS or not _in_scope(pol, c, data):
+                    continue
+                if user_goal:
+                    pending.append(("off_goal", c))
+                else:
+                    self.tracer.info(f"System One {c.id}: no user prompt in the session, skipped")
                 continue
             if c.when:
                 matched, err = pol.eval_when(c, data)
                 if err:
-                    action = pol.profile.on_eval_error
-                    sigs.append(self._signal(c, mode, f"błąd warunku CEL ({err}) → fail-closed: {action}", action=action))
+                    sigs.append(self._signal(c, f"CEL condition error ({err}) → fail-closed: block", action="block"))
                 elif matched:
-                    sigs.append(self._signal(c, mode, c.title))
-                elif c.verify is not None and effective["effect"] in RISKY_EFFECTS:
-                    # the rule did not fire; ask System One whether the action still breaks it (escalate only)
-                    vmode = _verify_mode(pol, c)
-                    state = {"rule": c.title, "user_request": Redactor().redact(user_goal)[0], "tool": name,
-                             "args": _loads(Redactor().redact(json.dumps(args, ensure_ascii=False))[0])}
-                    res = await self.systemone.ask_questions(pol.doc.systemone, rule_questions(c.verify), state,
-                                                             "violates", stub=lambda st: 0.05)
-                    s1_ms += res.latency_ms
-                    if res.probability is not None and res.probability >= c.verify.threshold:
-                        sigs.append(self._vsignal(f"{c.id}/verify", "escalate", vmode,
-                                                  f"reguła nie zadziałała, ale System One [{res.backend}] p={res.probability:.2f} "
-                                                  f"≥ {c.verify.threshold}: możliwe naruszenie „{c.title}”"))
-                    else:
-                        self.tracer.info(f"{c.id}/verify: System One [{res.backend}] "
-                                         + (f"p={res.probability:.2f}" if res.probability is not None else "bez wyniku")
-                                         + ": brak naruszenia")
-            elif c.detector == "systemone_matches_goal" and effective["effect"] in RISKY_EFFECTS:
-                if not user_goal:
-                    self.tracer.info(f"System One {c.id}: brak polecenia użytkownika w sesji, pomijam")
-                    continue
-                state = {"user_request": Redactor().redact(user_goal)[0], "tool": name,
-                         "args": _loads(Redactor().redact(json.dumps(args, ensure_ascii=False))[0])}
-                res = await self.systemone.ask(pol.doc.systemone, "off_goal", state)
-                s1_ms += res.latency_ms
-                sigs.append(self._s1_signal(c, mode, res, f"{name}: czy akcja wykracza poza polecenie?"))
+                    sigs.append(self._signal(c, c.title))
+                elif c.verify is not None and effective["effect"] in RISKY_EFFECTS and _verify_applies(pol, c, data):
+                    pending.append((_qname(c.id), c))     # the rule is silent: does the action break it anyway?
+        # 2. after a deterministic block there is nothing left for System One to decide: it is not asked
+        #    (it may make a decision stricter, never looser, so asking could not change the outcome)
+        if pending and _combine(sigs) == "block":
+            self.tracer.info(f"System One skipped ({', '.join(c.id for _, c in pending)}): "
+                             "a deterministic rule already blocked")
+        elif pending:
+            s1_ms += await self._ask_action(pol, name, args, user_goal, pending, sigs)
         decision = _combine(sigs)
         preview = Redactor().redact(json.dumps(args, ensure_ascii=False))[0]  # PII and secrets masked, never raw
         record = {"tool": name, "args_sha256": hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
                   "args_redacted": preview if len(preview) <= 600 else preview[:597] + "...",
                   "effect": effective["effect"], "destinations": facts["destinations"], "decision": decision,
-                  "controls": [s["control"] for s in sigs if s["enforced"] and s["action"] in ("block", "escalate")]}
+                  "controls": [s["control"] for s in sigs if s["action"] in ("block", "escalate")]}
         return decision, sigs, record, s1_ms
 
     async def _apply_to_model(self, pol: LoadedPolicy, model, session, body, signals):
@@ -343,24 +546,20 @@ class Gateway:
         plans: list[tuple[Control, set[str] | None, str]] = []
         class_ctrl = next((c for c in pol.controls_for("to_model") if c.detector == "fin_identifiers"), None)
         if class_ctrl and session["class_rank"] > pol.class_rank(model.max_class):
-            plans.append((class_ctrl, None, f"bo {model.id} ({model.location}) może widzieć najwyżej klasę "
-                                            f"{model.max_class}, a sesja ma {_class(pol, session)}"))
+            plans.append((class_ctrl, None, f"{model.id} ({model.location}) may see at most class "
+                                            f"{model.max_class}, the session holds {_class(pol, session)}"))
         for c in pol.controls_for("tool_result"):
             if c.detector == "identifiers" and c.action == "redact":
                 plans.append((c, set(c.kinds or []), c.title))
         if not plans:
-            self.tracer.info(f"klasa sesji {_class(pol, session)} ≤ max_class modelu {model.max_class}: bez maskowania")
+            self.tracer.info(f"session class {_class(pol, session)} ≤ the model's max_class {model.max_class}: no masking")
             return upstream_body, []
 
         redactor = Redactor()  # shared, so placeholders stay numbered consistently across rules
         applied: list[str] = []
         for control, kinds, why in plans:
-            mode = pol.mode_of(control)
-            if mode == "off":
-                continue
-            target = upstream_body if mode == "enforce" else copy.deepcopy(upstream_body)
             used: list[str] = []
-            for m in target.get("messages", []):
+            for m in upstream_body.get("messages", []):
                 if isinstance(m.get("content"), str):
                     m["content"], u = redactor.redact(m["content"], kinds)
                     used += u
@@ -369,9 +568,8 @@ class Gateway:
                     used += u
             unique = sorted(set(used), key=used.index)
             if unique:
-                signals.append(self._signal(control, mode, f"{', '.join(unique)} zamaskowane przed modelem: {why}"))
-                if mode == "enforce":
-                    applied += unique
+                signals.append(self._signal(control, f"{', '.join(unique)} masked before the model: {why}"))
+                applied += unique
 
         # second line: System One confirms nothing of that kind is left in each tool result
         names_by_id = {tc["id"]: tc["function"]["name"]
@@ -399,7 +597,7 @@ class Gateway:
         return upstream_body, applied
 
     async def _redact_result(self, pol: LoadedPolicy, session: dict[str, Any], tool: str, raw: Any,
-                             signals: list[dict[str, Any]]) -> tuple[Any, list[str], bool]:
+                             signals: list[dict[str, Any]], extra: list | None = None) -> tuple[Any, list[str], bool]:
         """Hooks and SDK: mask identifier kinds inside a tool result before it reaches the agent,
         then let System One confirm nothing is left. Returns (result, what changed, withheld?)."""
         redactor = session.setdefault("_redactor", Redactor())  # per session: [PESEL#1] stays the same person
@@ -408,88 +606,113 @@ class Gateway:
         for c in pol.controls_for("tool_result"):
             if c.detector != "identifiers" or c.action != "redact":
                 continue
-            mode = pol.mode_of(c)
-            if mode == "off":
-                continue
             kinds = set(c.kinds or [])
-            candidate, used = redact_json(obj, redactor, kinds)
+            obj, used = redact_json(obj, redactor, kinds)
             unique = sorted(set(used), key=used.index)
             if unique:
-                signals.append(self._signal(c, mode, f"{tool}: {', '.join(unique)} zamaskowane, zanim wynik trafi do agenta"))
-                if mode == "enforce":
-                    obj, applied = candidate, applied + unique
+                signals.append(self._signal(c, f"{tool}: {', '.join(unique)} masked before the result reaches the agent"))
+                applied += unique
             if c.verify is not None:
                 sensitive = bool(unique) or pol.class_rank(spec.output_class) >= pol.class_rank("client_pii")
-                obj, outcome = await self._verify_residue(pol, c, obj, kinds, sensitive, signals)
-                enforcing = _verify_mode(pol, c) == "enforce"
+                obj, outcome = await self._verify_residue(pol, c, obj, kinds, sensitive, signals, extra=extra)
                 if outcome in ("masked", "withheld"):  # suspected identifiers still mean the session touched PII
                     session["class_rank"] = max(session["class_rank"], pol.class_rank("client_pii"))
-                if outcome in ("masked", "withheld") and enforcing:
                     applied.append(outcome)
-                withheld = withheld or (outcome == "withheld" and enforcing)
+                withheld = withheld or outcome == "withheld"
         return obj, applied, withheld
 
     async def _verify_residue(self, pol: LoadedPolicy, c: Control, obj: Any, kinds: set[str], sensitive: bool,
-                              signals: list[dict[str, Any]]) -> tuple[Any, str]:
+                              signals: list[dict[str, Any]], extra: list | None = None) -> tuple[Any, str]:
         """precise masking (done) → residue hints? → System One → mask hinted spans → System One → withhold.
 
         System One alone never withholds: a withhold needs a second "yes" after masking, and a
         deterministic filter that found traces or a source known to carry client data."""
         v = c.verify
-        mode = _verify_mode(pol, c)
-        if mode == "off":
-            return obj, "skip"
         label = sorted(kinds)[0]
         cid = f"{c.id}/verify"
         hinted = any(residue_hints(t, kinds) for t in json_strings(obj))
         if not hinted and not sensitive:
             return obj, "skip"
-        why = "filtr znalazł ślady" if hinted else "wynik ze źródła z danymi klientów"
+        why = "the filter found traces" if hinted else "a result from a client-data source"
 
-        async def ask(o):
-            return await self.systemone.ask_questions(pol.doc.systemone, residue_questions(v), state_text(o), "residual",
-                                                      stub=lambda st: stub_residual(st, kinds))
+        async def ask(o, joined=()):
+            # other identifier kinds are masked too: System One only needs to see what this rule may have missed
+            questions = residue_questions(v)
+            stubs = {"residual": lambda st: stub_residual(st, kinds)}
+            if joined:
+                questions.update(QUESTIONS["directed_at_agent"])
+                stubs["directed_at_agent"] = lambda st: _stub_answer("directed_at_agent", st)
+            b = await self.systemone.ask_bundle(pol.doc.systemone, questions, Redactor().redact(state_text(o))[0], stubs,
+                                                meta={"after_rule": True})   # the identifier detector ran first
+            for item in joined:
+                self._resolve_directed(item, b)
+            return b.result("residual")
 
-        res = await ask(obj)
+        res = await ask(obj, [it for it in (extra or []) if not it.get("done")])
         if res.probability is None:
-            detail = res.error or res.note or "brak odpowiedzi"
+            detail = res.error or res.note or "no answer"
             if not hinted:
-                self.tracer.info(f"{cid}: System One bez wyniku ({detail}); brak śladów, wynik bez zmian")
+                self.tracer.info(f"{cid}: System One gave no answer ({detail}); no traces, result unchanged")
                 return obj, "error"
             masked, n = mask_residue(obj, kinds, label)
-            signals.append(self._vsignal(cid, "redact", mode, f"System One bez wyniku ({detail}); "
-                                                              f"maskuję deterministycznie {n} podejrzanych fragmentów"))
-            return (masked if mode == "enforce" else obj), "masked"
+            signals.append(self._vsignal(cid, "redact", f"System One gave no answer ({detail}); "
+                                                        f"masking {n} suspicious spans deterministically"))
+            return masked, "masked"
 
         form = res.extra.get("form")
-        line = (f"System One [{res.backend}] p={res.probability:.2f}" + (f", forma: {form}" if form else "")
+        line = (f"System One [{res.backend}] p={res.probability:.2f}" + (f", form: {form}" if form else "")
                 + f", {res.latency_ms} ms ({why})")
         if res.probability < v.threshold:
-            self.tracer.info(f"{cid}: {line} < próg {v.threshold} → potwierdzone: brak {label}")
-            signals.append({"control": cid, "action": "allow", "mode": mode, "enforced": False, "authority": "advisory",
+            self.tracer.info(f"{cid}: {line} < threshold {v.threshold} → confirmed: no {label}")
+            signals.append({"control": cid, "action": "allow", "authority": "advisory",
                             "reason": line, "probability": res.probability, "backend": res.backend})
             return obj, "pass"
 
         masked, n = mask_residue(obj, kinds, label)
         if n:
-            signals.append(self._vsignal(cid, "redact", mode, f"{line} ≥ próg {v.threshold} → maskuję {n} podejrzanych fragmentów"))
+            signals.append(self._vsignal(cid, "redact", f"{line} ≥ threshold {v.threshold} → masking {n} suspicious spans"))
             res2 = await ask(masked)
             if res2.probability is not None and res2.probability < v.threshold:
-                self.tracer.info(f"{cid}: po maskowaniu p={res2.probability:.2f} < próg → wynik idzie dalej")
-                return (masked if mode == "enforce" else obj), "masked"
-            second = "System One bez wyniku" if res2.probability is None else f"po maskowaniu nadal p={res2.probability:.2f}"
+                self.tracer.info(f"{cid}: after masking p={res2.probability:.2f} < threshold → the result goes through")
+                return masked, "masked"
+            second = "System One gave no answer" if res2.probability is None else f"still p={res2.probability:.2f} after masking"
         else:
-            second = "filtr nie wskazał, co zamaskować"
-        what = "wstrzymany" if v.on_fail == "withhold" else "wstrzymany do przeglądu"
-        notice = f"[SpireGate: wynik {what} ({c.id}): możliwy {label} w nierozpoznanej formie, zdarzenie #{self._n}]"
-        signals.append(self._vsignal(cid, "withhold", mode, f"{line}; {second} → wynik {what}"))
-        return (withhold_json(obj, notice) if mode == "enforce" else obj), "withheld"
+            second = "the filter found nothing to mask"
+        what = "withheld" if v.on_fail == "withhold" else "withheld for review"
+        notice = f"[SpireGate: result {what} ({c.id}): possible {label} in an unrecognised form, event #{self._n}]"
+        signals.append(self._vsignal(cid, "withhold", f"{line}; {second} → result {what}"))
+        return withhold_json(obj, notice), "withheld"
 
-    def _vsignal(self, cid: str, action: str, mode: str, reason: str) -> dict[str, Any]:
-        enforced = mode == "enforce"
-        self.tracer.decision(action, cid, reason, enforced=enforced)
-        return {"control": cid, "action": action, "mode": mode, "enforced": enforced,
-                "authority": "corroborated", "reason": reason}
+    def _vsignal(self, cid: str, action: str, reason: str) -> dict[str, Any]:
+        self.tracer.decision(action, cid, reason)
+        return {"control": cid, "action": action, "authority": "corroborated", "reason": reason}
+
+    # ================================================================== signature feed
+    def _feed_signals(self, pol: LoadedPolicy, phase: str, texts: list[str], files=()) -> list[dict[str, Any]]:
+        sigs = signals_for(self.feed.current, pol.controls_for(phase), phase, texts, files)
+        for s in sigs:
+            self.tracer.decision(s["action"], s["control"], s["reason"])
+        return sigs
+
+    def _drop_poisoned_tools(self, pol: LoadedPolicy, body: dict[str, Any], signals: list[dict[str, Any]]) -> list[str]:
+        """Tool definitions come from the tool's server (e.g. MCP), so they are untrusted content: a definition
+        that carries a known attack (hidden <IMPORTANT> instructions...) is removed before the model sees it."""
+        kept, dropped = [], []
+        for t in body.get("tools") or []:
+            fn = t.get("function") or {}
+            hits = self._feed_signals(pol, "tool_result", json_strings(fn))
+            if stops(hits):
+                dropped.append(str(fn.get("name", "?")))
+                signals.extend(hits)
+            else:
+                kept.append(t)
+        if dropped:
+            body["tools"] = kept
+            if not kept:
+                body.pop("tools", None)
+                body.pop("tool_choice", None)
+            self.tracer.info(f"poisoned tools removed: {', '.join(dropped)} (the model never sees them)")
+        return dropped
 
     # ================================================================== helpers
     def _policy(self) -> LoadedPolicy:
@@ -497,61 +720,116 @@ class Gateway:
         for ev in self.store.events[self._events_shown:]:
             self.tracer.policy(ev)
         self._events_shown = len(self.store.events)
+        self.feed.sync(pol.doc.feed)   # a local feed file is re-read on change; an http feed is polled in the background
+        for ev in self.feed.events[self._feed_events_shown:]:
+            self.tracer.policy(f"signature feed: {ev['message']}")
+        self._feed_events_shown = len(self.feed.events)
         self._n += 1
         return pol
 
-    def _signal(self, c: Control, mode: str, reason: str, *, action: str | None = None) -> dict[str, Any]:
+    def _signal(self, c: Control, reason: str, *, action: str | None = None) -> dict[str, Any]:
         action = action or c.action
         if c.authority == "corroborating" and action == "block":
             action = "taint"  # heuristics never block alone
-        enforced = mode == "enforce"
-        self.tracer.decision(action, c.id, reason, enforced=enforced)
-        return {"control": c.id, "action": action, "mode": mode, "enforced": enforced,
-                "authority": c.authority, "reason": reason}
+        self.tracer.decision(action, c.id, reason)
+        return {"control": c.id, "action": action, "authority": c.authority, "reason": reason}
 
-    def _s1_signal(self, c: Control, mode: str, res, question: str) -> dict[str, Any]:
-        if res.probability is None:
-            detail = res.error or res.note or "brak odpowiedzi"
-            self.tracer.info(f"System One [{res.backend}] {question} → brak wyniku ({detail}); bez wpływu (advisory)")
-            return {"control": c.id, "action": "allow", "mode": mode, "enforced": False,
-                    "authority": "advisory", "reason": detail, "backend": res.backend}
+    def _s1_signal(self, c: Control, res, question: str) -> dict[str, Any]:
+        """System One's verdict on one rule: approve (below escalate_at), review (escalate) or block (block_at)."""
+        p = res.probability
+        if p is None:
+            detail = res.error or res.note or "no answer"
+            if c.authority == "semantic" and res.error and c.on_error != "allow":
+                # the rule has no deterministic fallback: an outage must not silently approve
+                action = "escalate" if c.on_error == "review" else "block"
+                sig = self._signal(c, f"{question}: System One unavailable ({detail}) → "
+                                      + ("to review" if action == "escalate" else "blocked"), action=action)
+                sig.update(backend=res.backend)
+                return sig
+            self.tracer.info(f"System One [{res.backend}] {question} → no answer ({detail}); no effect")
+            return {"control": c.id, "action": "allow", "authority": c.authority, "reason": detail, "backend": res.backend}
         note = f" ({res.note})" if res.note else ""
-        text = f"System One [{res.backend}{note}] {question} p={res.probability:.2f}, {res.latency_ms} ms"
-        if c.escalate_at is None or res.probability < c.escalate_at:
-            self.tracer.info(text + f" < próg {c.escalate_at}: bez sygnału")
-            return {"control": c.id, "action": "allow", "mode": mode, "enforced": False, "authority": "advisory",
-                    "reason": text, "probability": res.probability, "backend": res.backend}
-        sig = self._signal(c, mode, text + f" ≥ próg {c.escalate_at}")
-        sig.update(probability=res.probability, backend=res.backend)
+        text = f"System One [{res.backend}{note}] {question} p={p:.2f}, {res.latency_ms} ms"
+        if c.block_at is not None and p >= c.block_at:
+            sig = self._signal(c, text + f" ≥ {c.block_at}: blocked", action="block")
+        elif c.escalate_at is not None and p >= c.escalate_at:
+            sig = self._signal(c, text + f" ≥ {c.escalate_at}: to review", action="escalate")
+        else:
+            self.tracer.info(text + f" < {c.escalate_at}: approved")
+            return {"control": c.id, "action": "allow", "authority": c.authority,
+                    "reason": text, "probability": p, "backend": res.backend}
+        sig.update(probability=p, backend=res.backend)
         return sig
 
     def _audit(self, pol, identity, surface, decision, signals, latency, extra=None) -> None:
-        self.audit.append({
+        record = self.audit.append({
             "request": self._n, "surface": surface,
             "agent": identity.agent_id if identity else None,
             "desk": identity.desk if identity else None,
             "decision": decision, "signals": signals, "latency": latency,
-            "policy": {"rev": pol.rev, "sha": pol.sha, "profile": pol.profile_name},
+            "policy": {"rev": pol.rev, "sha": pol.sha},
+            **({"feed": {"v": self.feed.current.version, "sha": self.feed.current.sha}} if self.feed.current else {}),
+            **({"sim": True} if SIMULATED.get() else {}),  # synthetic load is labelled as such
             **(extra or {}),
         })
-
-
-_MODE_ORDER = {"off": 0, "monitor": 1, "enforce": 2}
-
-
-def _verify_mode(pol: LoadedPolicy, c: Control) -> str:
-    """verify.mode can only make a rule more lenient, never stricter than the rule's own mode."""
-    rule = pol.mode_of(c)
-    own = c.verify.mode if c.verify and c.verify.mode else rule
-    return min(rule, own, key=_MODE_ORDER.__getitem__)
+        self.bus.end(decision, signals, latency, (extra or {}).get("cost"), record.get("seq"))
 
 
 def _combine(signals: list[dict[str, Any]]) -> str:
     worst = "allow"
     for s in signals:
-        if s["enforced"] and s["action"] in ("block", "escalate") and ACTION_SEVERITY[s["action"]] > ACTION_SEVERITY[worst]:
+        if s["action"] in ("block", "escalate") and ACTION_SEVERITY[s["action"]] > ACTION_SEVERITY[worst]:
             worst = s["action"]
     return worst
+
+
+def _taint_on_feed_hit(session: dict[str, Any], signals: list[dict[str, Any]]) -> None:
+    """A result that carried a known attack makes the session untrusted, whatever the source claimed."""
+    if any(s.get("signature") and s.get("action") != "allow" for s in signals):
+        session["integrity"] = "untrusted"
+
+
+def _assistant(body: dict[str, Any], content: str) -> dict[str, Any]:
+    """A chat completion the gateway answers itself (nothing was sent to the model, nothing was spent)."""
+    return {"id": "spiregate-refusal", "object": "chat.completion", "created": int(time.time()),
+            "model": body.get("model"), "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}
+
+
+def _in_scope(pol: LoadedPolicy, c: Control, data: dict[str, Any]) -> bool:
+    """For a rule only System One judges, `when` is its scope. A broken scope asks anyway."""
+    if not c.when:
+        return True
+    matched, err = pol.eval_when(c, data)
+    return True if err else bool(matched)
+
+
+def _rule_acted(s: dict[str, Any]) -> bool:
+    """A deterministic rule or heuristic (not System One) changed something in this request."""
+    return s.get("action") not in (None, "allow") and s.get("authority") not in ("advisory", "semantic", "corroborated")
+
+
+def _verify_applies(pol: LoadedPolicy, c: Control, data: dict[str, Any]) -> bool:
+    """Ask System One about a rule only where the rule means something. A broken scope asks anyway:
+    an extra advisory question is the safer mistake."""
+    if not c.verify.when:
+        return True
+    matched, err = pol.eval_when(c, data, key=f"{c.id}/verify")
+    return True if err else bool(matched)
+
+
+def _qname(control_id: str) -> str:
+    """A System One question name per rule, so many rules fit in one call."""
+    return "verify_" + "".join(ch if ch.isalnum() else "_" for ch in control_id)
+
+
+def _action_label(tool: str, args: dict[str, Any]) -> str:
+    """Short, masked description of an action for the live stream (never raw PII or secrets)."""
+    main = next((args[k] for k in ("command", "cmd", "file_path", "path", "url", "to", "pattern") if args.get(k)), "")
+    if isinstance(main, list):
+        main = " ".join(map(str, main))
+    text = f"{tool}: {main}" if main else tool
+    return Redactor().redact(str(text))[0][:90]
 
 
 def _class(pol: LoadedPolicy, session: dict[str, Any]) -> str:
@@ -563,7 +841,7 @@ def _session_view(pol: LoadedPolicy, session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _session_line(pol: LoadedPolicy, session: dict[str, Any]) -> str:
-    return f"etykiety sesji: integrity={session['integrity']}, class={_class(pol, session)}"
+    return f"session labels: integrity={session['integrity']}, class={_class(pol, session)}"
 
 
 def _loads(arguments: Any) -> dict[str, Any]:

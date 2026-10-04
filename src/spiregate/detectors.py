@@ -7,8 +7,9 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from stdnum import iban, isin, lei, luhn
-from stdnum.pl import pesel
+from stdnum import bic, cusip, iban, isin, lei, luhn
+from stdnum.pl import nip, pesel, regon
+from stdnum.us import rtn, ssn
 
 _ZERO_WIDTH = re.compile("[​-‏‪-‮⁠-⁤﻿]")
 _UNICODE_TAGS = re.compile("[\U000e0000-\U000e007f]")
@@ -38,7 +39,17 @@ def _card_valid(s: str) -> bool:
     return 13 <= len(s) <= 19 and luhn.is_valid(s)
 
 
-KNOWN_KINDS = frozenset({"IBAN", "LEI", "ISIN", "CARD", "PESEL", "SECRET"})
+# Always detected (they label a session as holding client data). Validated by checksum, or a high-confidence format.
+BASE_KINDS = frozenset({"IBAN", "LEI", "ISIN", "CARD", "PESEL", "SECRET"})
+# Opt-in: detected only where a rule asks for them. Several are bare 9-10 digit numbers with a checksum, so
+# detecting them everywhere would turn order numbers into "client data".
+EXTRA_KINDS = frozenset({"NIP", "REGON", "SSN", "ABA", "CUSIP", "BIC", "EMAIL", "PHONE"})
+KNOWN_KINDS = BASE_KINDS | EXTRA_KINDS
+KIND_LABELS = {
+    "PESEL": "PESEL", "IBAN": "IBAN", "CARD": "card number", "LEI": "LEI", "ISIN": "ISIN", "SECRET": "secrets and keys",
+    "NIP": "NIP (PL tax id)", "REGON": "REGON", "SSN": "SSN", "ABA": "routing number (ABA)", "CUSIP": "CUSIP",
+    "BIC": "SWIFT / BIC", "EMAIL": "email", "PHONE": "phone number",
+}
 
 # High-confidence secret formats. For key=value forms only the value (group 1) is masked.
 _SECRETS = [re.compile(p, f) for p, f in [
@@ -74,10 +85,28 @@ def _shrink_to_valid(raw: str, valid) -> str | None:
     return None
 
 
-def find_identifiers(text: str) -> list[Finding]:
+_DIGITS = re.compile(r"\D")
+_EXTRA_CANDIDATES = [   # order matters when one number fits two kinds (an ABA routing number vs a CUSIP)
+    ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), lambda s: ssn.is_valid(s)),
+    ("BIC", re.compile(r"\b[A-Z]{4}(?:PL|US|GB|DE|FR|CH|LU|IE|NL|IT|ES|JP|HK|SG|AT|BE|SE|NO|DK|FI|CZ)[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b"),
+     lambda s: bic.is_valid(s)),
+    ("NIP", re.compile(r"\b(?:PL ?)?\d{3}[- ]?\d{3}[- ]?\d{2}[- ]?\d{2}\b|\b(?:PL ?)?\d{3}[- ]?\d{2}[- ]?\d{2}[- ]?\d{3}\b"),
+     lambda s: nip.is_valid(_DIGITS.sub("", s))),
+    ("ABA", re.compile(r"\b\d{9}\b"), lambda s: rtn.is_valid(s)),
+    ("CUSIP", re.compile(r"\b[0-9]{3}[0-9A-Z]{5}\d\b"), lambda s: cusip.is_valid(s)),
+    ("REGON", re.compile(r"\b\d{9}(?:\d{5})?\b"), lambda s: regon.is_valid(s)),
+    ("EMAIL", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"), lambda s: True),
+    ("PHONE", re.compile(r"(?<![\w+])(?:\+48[ -]?\d{3}[ -]?\d{3}[ -]?\d{3}|\+1[ -]?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}"
+                         r"|\b\d{3}[ -]\d{3}[ -]\d{3})\b"), lambda s: True),
+]
+
+
+def find_identifiers(text: str, extra: set[str] | frozenset[str] | None = None) -> list[Finding]:
+    """Base kinds always; opt-in kinds (EXTRA_KINDS) only when asked for in `extra`."""
     found: list[Finding] = []
     taken: list[tuple[int, int]] = []
-    for kind, pattern, valid in _CANDIDATES:
+    wanted = [c for c in _EXTRA_CANDIDATES if extra and c[0] in extra]
+    for kind, pattern, valid in _CANDIDATES + wanted:
         for m in pattern.finditer(text):
             start = m.start()
             if any(a <= start < b for a, b in taken):
@@ -107,7 +136,8 @@ class Redactor:
 
     def redact(self, text: str, kinds: set[str] | None = None) -> tuple[str, list[str]]:
         """Masks identifiers; with `kinds`, only those kinds (detection still runs for all, so spans stay right)."""
-        findings = [f for f in find_identifiers(text) if kinds is None or f.kind in kinds]
+        findings = [f for f in find_identifiers(text, extra=(kinds & EXTRA_KINDS) if kinds else None)
+                    if kinds is None or f.kind in kinds]
         if not findings:
             return text, []
         out, last, used = [], 0, []
@@ -207,7 +237,8 @@ def residue_hints(text: str, kinds: set[str]) -> list[Hint]:
     for kind in kinds:
         for kw in KIND_KEYWORDS.get(kind, []):
             for m in re.finditer(rf"\b{kw}\w*", scrub, re.I):
-                d = re.search(r"\d(?:[\d\s.\-]*\d)?", scrub[m.end():m.end() + 40])
+                window = scrub[m.end():m.end() + 40].split("\n", 1)[0]  # same line: the next line is another field
+                d = re.search(r"\d(?:[\d \t.\-]*\d)?", window)
                 if d:
                     hints.append(Hint(m.end() + d.start(), m.end() + d.end(), f"cyfry obok słowa „{kw}”"))
     hints.sort(key=lambda h: (h.start, -h.end))

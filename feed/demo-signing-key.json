@@ -1,0 +1,6 @@
+{
+  "key_id": "spire-intel-demo",
+  "note": "DEMO KEY. Kept in the repository only so judges can sign their own signatures (make feed-sign). In production the private key lives only in the threat-intel system (HSM/KMS).",
+  "public_key": "EYFXpWRze0zeeXg+mdeQyBaPO9nK8/1kxyxxu7KLg9M=",
+  "private_key": "V51IFiy/vBVhsHygEjthD99RojOZqUVPgwvv8BHvxRs="
+}

@@ -22,7 +22,7 @@ import httpx
 
 class Blocked(RuntimeError):
     def __init__(self, decision: str, reasons: list[str]):
-        super().__init__(f"SpireGate: {decision}: {'; '.join(reasons) or 'gateway niedostępny'}")
+        super().__init__(f"SpireGate: {decision}: {'; '.join(reasons) or 'gateway unreachable'}")
         self.decision = decision
         self.reasons = reasons
 
@@ -42,7 +42,7 @@ class Guard:
             r.raise_for_status()
             return r.json()
         except httpx.HTTPError as e:
-            raise Blocked("block", [f"gateway niedostępny ({type(e).__name__})"]) from e
+            raise Blocked("block", [f"gateway unreachable ({type(e).__name__})"]) from e
 
     def prompt(self, user_request: str) -> None:
         self._decide({"phase": "prompt", "user_request": user_request})

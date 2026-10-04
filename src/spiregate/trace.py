@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
+
 from rich.console import Console
 from rich.markup import escape
+
+from .events import SIMULATED
+
+# Lines emitted inside one request's task; concurrent requests (load generator) never mix into it.
+_CAPTURE: ContextVar[list[str] | None] = ContextVar("spire_trace_capture", default=None)
 
 _STYLE = {
     "allow": "bold green",
@@ -12,7 +21,6 @@ _STYLE = {
     "escalate": "bold magenta",
     "block": "bold red",
     "withhold": "bold red",
-    "would": "dim",
 }
 
 
@@ -24,7 +32,12 @@ class Tracer:
 
     def _out(self, markup: str, plain: str) -> None:
         self.lines.append(plain)
-        if self.enabled:
+        if len(self.lines) > 20000:  # long-running server: keep memory flat
+            del self.lines[:10000]
+        captured = _CAPTURE.get()
+        if captured is not None:
+            captured.append(plain)
+        if self.enabled and not SIMULATED.get():  # synthetic load stays off the console
             self.console.print(markup)
 
     def header(self, text: str) -> None:
@@ -36,13 +49,17 @@ class Tracer:
     def policy(self, text: str) -> None:
         self._out(f"  [bold yellow]⚑ polityka:[/] {escape(text)}", f"  ! policy: {text}")
 
-    def decision(self, action: str, control: str, text: str, *, enforced: bool = True) -> None:
-        if enforced:
-            tag = f"[{_STYLE.get(action, 'bold')}]{action.upper():8}[/]"
-            plain = f"  {action.upper():8} {control}: {text}"
-        else:
-            tag = f"[{_STYLE['would']}]would_{action:8}[/]"
-            plain = f"  would_{action} {control}: {text}"
+    @contextmanager
+    def capture(self) -> Iterator[list[str]]:
+        token = _CAPTURE.set([])
+        try:
+            yield _CAPTURE.get()
+        finally:
+            _CAPTURE.reset(token)
+
+    def decision(self, action: str, control: str, text: str) -> None:
+        tag = f"[{_STYLE.get(action, 'bold')}]{action.upper():8}[/]"
+        plain = f"  {action.upper():8} {control}: {text}"
         self._out(f"  [cyan]│[/] {tag} [bold]{escape(control)}[/] {escape(text)}", plain)
 
     def verdict(self, action: str, text: str) -> None:

