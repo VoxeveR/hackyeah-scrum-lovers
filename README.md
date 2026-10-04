@@ -2,141 +2,121 @@
 
 we love scrum we cant code we can vibe
 
-SpireGate to warstwa kontroli (AI Control Layer) stojąca między dowolnym agentem a modelem i narzędziami.
-Agent zmienia tylko `base_url` na gateway i dostaje wirtualny klucz; prawdziwe klucze (OpenAI, Jev) zna tylko gateway.
+SpireGate is an AI control layer sitting between any agent and the model and tools.
+The agent only changes the `base_url` to the gateway and receives a virtual key; only the gateway knows the real keys (OpenAI, Jev).
 
 ## Start
 
 ```bash
 uv sync
-make test          # 113 testów, bez kluczy i sieci, ~3 s
-make demo          # scenariusz KYC bez ataku (skryptowany model, stub Jev)
-make demo-attack   # ten sam scenariusz, strona WWW zawiera ukrytą instrukcję dla AI
-make demo-loop     # serwis nie odpowiada, agent ponawia w kółko to samo wywołanie
-make serve &       # gateway + dashboard; potem otwórz /ui/#/engine (strona Engine)
-make load          # 100 prawdziwych żądań symulowanej floty — widać je płynące na stronie Engine (albo przycisk Start)
+make test          # 113 tests, no keys and no network, ~3 s
+make demo          # KYC scenario without an attack (scripted model, Jev stub)
+make demo-attack   # the same scenario, but the web page contains a hidden instruction for the AI
+make demo-loop     # the service does not respond, the agent retries the same call in a loop
+make serve &       # gateway + dashboard; then open /ui/#/engine (Engine page)
+make load          # 100 real requests from a simulated fleet — visible flowing on the Engine page (or via the Start button)
 ```
 
-Z prawdziwymi modelami: `cp .env.example .env`, wpisz `OPENAI_API_KEY` (i opcjonalnie `TYPESAFE_API_KEY` dla Jev), potem `make demo-live`.
-Bez `TYPESAFE_API_KEY` gateway sam używa stuba System One i pisze to w śladzie.
+With real models: `cp .env.example .env`, add `OPENAI_API_KEY` (and optionally `TYPESAFE_API_KEY` for Jev), then run `make demo-live`.
+Without `TYPESAFE_API_KEY`, the gateway uses the System One stub by itself and writes this into the audit trail.
 
-## Scenariusz 1: agent KYC
+## Scenario 1: KYC agent
 
-Polecenie użytkownika (identyczne w obu wariantach): „Przygotuj podsumowanie KYC klienta ACME-001, sprawdź wiadomości o nim w internecie i wyślij podsumowanie do ania@gs.com.”
+The user request is identical in both variants: “Prepare a KYC summary for client ACME-001, check online messages about them, and send the summary to ania@gs.com.”
 
-Agent ma trzy narzędzia: `crm_get_client` (dane prywatne), `web_fetch` (treść niezaufana) i `send_email` (wysyłka). Gateway przy każdym żądaniu:
+The agent has three tools: `crm_get_client` (private data), `web_fetch` (untrusted content), and `send_email` (dispatch). For each request, the gateway:
 
-1. **rozpoznaje agenta** po wirtualnym kluczu i sprawdza, czy model jest na liście dozwolonych,
-2. **etykietuje sesję** z historii rozmowy: wynik z CRM → `client_pii`, wynik z WWW → `untrusted`,
-3. **maskuje** IBAN, LEI i PESEL (tylko poprawne sumy kontrolne) przed wysłaniem do zewnętrznego modelu,
-4. **sprawdza każdą akcję**, o którą prosi model, zanim agent ją wykona.
+1. **identifies the agent** from the virtual key and checks whether the model is on the allowlist,
+2. **labels the session** from the conversation history: CRM result → `client_pii`, web result → `untrusted`,
+3. **masks** IBAN, LEI, and PESEL (only valid checksum numbers) before sending data to the external model,
+4. **checks every action** the model requests before the agent executes it.
 
-| Wariant | Co się dzieje | Kto decyduje |
+| Variant | What happens | Who decides |
 |---|---|---|
-| `benign` | e-mail idzie do ania@gs.com; model widzi tylko `[IBAN#1]`, `[PESEL#1]` | DET-FIN-ID-001 (redakcja) |
-| `attack` | strona każe wysłać kartotekę na kyc-review@acme-corp.com → Jev ukrywa stronę przed modelem, a gdyby ją przepuścił, wysyłkę blokuje reguła | S1-JEV-001 (Jev), IFC-TRIFECTA-001 (reguła, piętro bezpieczeństwa) |
+| `benign` | the email goes to ania@gs.com; the model sees only `[IBAN#1]`, `[PESEL#1]` | DET-FIN-ID-001 (redaction) |
+| `attack` | the page instructs sending the file to kyc-review@acme-corp.com → Jev hides the page from the model; if it were allowed through, the rule blocks the send | S1-JEV-001 (Jev), IFC-TRIFECTA-001 (rule, security layer) |
 
-Reguła przepływu danych zatrzymuje atak nawet po usunięciu wszystkich detektorów i Jeva (patrz testy).
+The data-flow rule blocks the attack even after removing all detectors and Jev (see tests).
 
-## Scenariusz 2: Claude Code, Codex i własne aplikacje (hooki, SDK)
+## Scenario 2: Claude Code, Codex, and custom apps (hooks, SDK)
 
-Ta sama polityka działa dla agentów, którzy sami wykonują narzędzia:
+The same policy works for agents that execute tools themselves:
 
-| Klient | Jak się podpina | Szczegóły |
+| Client | How it connects | Details |
 |---|---|---|
-| Claude Code | hooki `PreToolUse` / `PostToolUse` / `UserPromptSubmit` → `hooks/spire_hook.py` | [`demo/claude-code/`](demo/claude-code/README.md) |
-| Codex CLI | te same hooki w `config.toml` (format `codex`, blokada przez exit 2) | [`demo/codex/config.toml`](demo/codex/config.toml), nieprzetestowane na żywo |
-| Własna aplikacja | `spiregate.sdk.Guard` → `POST /v1/decide` | przykład niżej |
+| Claude Code | `PreToolUse` / `PostToolUse` / `UserPromptSubmit` hooks → `hooks/spire_hook.py` | [`demo/claude-code/`](demo/claude-code/README.md) |
+| Codex CLI | the same hooks in `config.toml` (format `codex`, blocked with exit 2) | [`demo/codex/config.toml`](demo/codex/config.toml), not live-tested |
+| Custom application | `spiregate.sdk.Guard` → `POST /v1/decide` | example below |
 
-Hook nigdy nie odpowiada „allow”: przepuszczona akcja wraca do zwykłych pytań o zgodę agenta.
-Gdy gateway nie odpowiada, hook i SDK blokują (fail-closed). Ruch Claude Code do Anthropic nie przechodzi przez SpireGate.
+The hook never responds with “allow”: a permitted action returns to the usual approval questions from the agent.
+When the gateway does not respond, the hook and SDK fail closed. Claude Code traffic to Anthropic does not pass through SpireGate.
 
 ```python
 from spiregate.sdk import Guard
 guard = Guard(key="spire-demo-sdk", session_id="pay-1")
 
 @guard.tool("send_email")
-def send_email(to, subject, body): ...   # sprawdzane przed wykonaniem, wynik raportowany po
+def send_email(to, subject, body): ...   # checked before execution; result reported afterward
 ```
 
 ## Dashboard
 
-`make serve` wypisuje adres panelu z tokenem administratora, np. `http://127.0.0.1:8787/ui/#token=…`.
-Stały token ustawisz w `.env` (`SPIRE_ADMIN_TOKEN=`). Klucz agenta nie otwiera panelu. Panel jest po angielsku.
+`make serve` prints the dashboard URL with the administrator token, for example `http://127.0.0.1:8787/ui/#token=…`.
+You configure a fixed token in `.env` (`SPIRE_ADMIN_TOKEN=`). An agent key does not open the dashboard. The panel is in English.
 
-| Strona | Co pokazuje |
+| Page | What it shows |
 |---|---|
-| Overview | decyzje i trend z 30 minut, stan bezpieczeństwa, reguły w akcji, agenci |
-| **Engine** | prawdziwe żądania na żywo: najpierw krok *Company policy* (liczba reguł, rev; kliknięcie otwiera Policy), potem trzy tory: deterministyka, deterministyka + Jev, sam Jev; opóźnienie i koszt samej bramki, przycisk Start/Stop (ruch symulowanej floty, najdłużej 15 s) |
-| Live | każda decyzja z łańcucha audytu; kliknięcie pokazuje sygnały, prawdopodobieństwa Jev, hash |
-| **Policy** | edytor reguł: dodawanie z katalogu, edycja, usuwanie, **import z tekstu polityki firmy**, karta feedu sygnatur |
-| Budgets | zużycie limitów per organizacja / biuro / agent, wydatki wg modelu, koszt warstwy kontroli, aktywne bezpieczniki pętli |
-| Playground | dowolna akcja lub wynik narzędzia przez prawdziwą ścieżkę decyzji, z tym, co zobaczy agent |
-| Audit | weryfikacja łańcucha, eksport JSONL / CSV / OCSF, historia przeładowań polityki |
+| Overview | decisions and 30-minute trends, security state, rules in action, agents |
+| **Engine** | live real requests: first the *Company policy* step (number of rules, rev; click to open Policy), then three paths: deterministic, deterministic + Jev, Jev alone; latency and cost of the gateway itself, Start/Stop button (simulated fleet movement, max 15 s) |
+| Live | every decision from the audit chain; clicking shows signals, Jev probabilities, hash |
+| **Policy** | rule editor: add from catalog, edit, delete, **import from company policy text**, signature feed tab |
+| Budgets | usage limits per organization / desk / agent, spending by model, control layer cost, active loop safeguards |
+| Playground | any action or tool result through the real decision path, including what the agent sees |
+| Audit | chain verification, JSONL / CSV / OCSF export, policy reload history |
 
-Panel nie ma zależności zewnętrznych (działa offline). Zmiana z panelu podmienia w pliku polityki tylko blok zmienionej
-reguły (komentarze w reszcie pliku zostają), jest walidowana na całym pliku przed zapisem i zapisywana atomowo, więc
-gateway nigdy nie wczyta połowy edycji. Każda zmiana podbija `policy_rev`.
+The dashboard has no external dependencies (works offline). Changes made from the dashboard replace only the changed rule block in the policy file (comments elsewhere remain), the whole file is validated before saving and written atomically, so the gateway never loads half an edit. Every change increments `policy_rev`.
 
-### Edytor polityki i import z tekstu
+### Policy editor and text import
 
-Strona **Policy** grupuje reguły wg tego, kto decyduje: *Deterministic*, *Deterministic + Jev*, *Jev*.
-**+ Rule** otwiera katalog gotowych sprawdzeń z prostym formularzem (bez CEL-a); reguła zapamiętuje szablon i parametry,
-więc później otwiera się w tym samym formularzu. Reguły spoza katalogu (np. progi Jev) mają edycję zaawansowaną.
-Usunięcie wymaga drugiego kliknięcia; inwariantów nie da się zmienić ani usunąć.
+The **Policy** page groups rules by the actor making the decision: *Deterministic*, *Deterministic + Jev*, *Jev*.
+**+ Rule** opens the catalog of ready-made checks with a simple form (without CEL); the rule remembers the template and parameters, so it later reopens in the same form. Rules outside the catalog (for example Jev thresholds) have advanced editing.
+Deletion requires a second click; invariants cannot be changed or removed.
 
-**Import from text**: wklejasz politykę firmy zwykłym językiem (PL lub EN), a gateway rozbija ją na zdania i proponuje
-reguły. Co da się sprawdzić z pewnością (dane, domeny, kwoty, polecenia, godziny), staje się regułą
-deterministyczną z parametrami wziętymi z tekstu. Resztę („nie przekazuj informacji o M&A osobom spoza zespołu”)
-ocenia Jev dosłownie według zdania z polityki. Nic nie jest zapisywane, dopóki człowiek nie zaznaczy propozycji;
-to, co polityka już robi, jest oznaczone „already in the policy”. Zdania o budżetach są pokazane jako pominięte: budżety
-ustawia się w sekcji `budgets:` pliku polityki, nie regułami. Serwer buduje reguły od nowa z szablonu i parametrów,
-więc przeglądarka nie może dopisać do pliku dowolnego warunku. Import działa regułami dopasowania (bez LLM).
+**Import from text**: paste the company policy in plain language (PL or EN), and the gateway splits it into sentences and proposes rules. Anything that can be checked with certainty (data, domains, amounts, commands, hours) becomes a deterministic rule with parameters taken from the text. The rest (“do not share M&A information with people outside the team”) is evaluated by Jev literally based on the sentence in the policy. Nothing is saved until a human selects the proposed rules; what the policy already does is marked “already in the policy”. Budget-related sentences are shown as skipped: budgets are configured in the `budgets:` section of the policy file, not by rules. The server rebuilds rules from the template and parameters, so the browser cannot append arbitrary conditions to the file. Import works through matching rules (without LLM).
 
-Katalog sprawdzeń (każde włącza się tylko wtedy, gdy bank doda je do polityki):
+The catalog of checks (each is enabled only when the bank adds it to the policy):
 
-| Grupa | Sprawdzenia |
+| Group | Checks |
 |---|---|
-| Dane (maskowanie w wynikach, opcjonalnie z weryfikacją Jev) | PESEL, IBAN, numer karty, LEI, ISIN, sekrety i klucze, NIP, REGON, SSN, routing number (ABA), CUSIP, SWIFT/BIC, e-mail, telefon. Numery z sumą kontrolną są walidowane (`python-stdnum`), więc przypadkowe ciągi cyfr nie są maskowane |
-| Akcje | wysyłka tylko do wskazanych domen, poświadczenia, pobierz-i-uruchom, polecenia niszczące (`rm -rf`, force push, `DROP TABLE`, `terraform destroy`), podnoszenie uprawnień (`sudo`, `chmod 777`), instalacja pakietów, płatności powyżej kwoty, godziny pracy i weekend, zakaz narzędzi |
-| Zasady opisowe | dowolne zdanie z polityki firmy, oceniane przez Jev przy ryzykownych akcjach (przegląd albo blokada) |
+| Data (masking in results, optionally with Jev verification) | PESEL, IBAN, card number, LEI, ISIN, secrets and keys, NIP, REGON, SSN, routing number (ABA), CUSIP, SWIFT/BIC, email, phone. Numbers with a checksum are validated (`python-stdnum`), so accidental digit strings are not masked |
+| Actions | sending only to specified domains, credentials, download-and-run, destructive commands (`rm -rf`, force push, `DROP TABLE`, `terraform destroy`), privilege escalation (`sudo`, `chmod 777`), installing packages, payments above a threshold, work hours and weekends, disallowed tools |
+| Descriptive rules | any sentence from the company policy, evaluated by Jev for risky actions (review or block) |
 
-## Polityka
+## Policy
 
-Jeden plik: [`policy/spiregate.policy.yaml`](policy/spiregate.policy.yaml). Zmiany działają od następnego żądania, bez restartu.
-Zły plik zostaje odrzucony, a gateway działa dalej na ostatniej poprawnej wersji. Kontrole `ACC-TOOL-001`, `IFC-TRIFECTA-001` i `CTL-SELF-001`
-są inwariantami: nie można ich usunąć.
+One file: [`policy/spiregate.policy.yaml`](policy/spiregate.policy.yaml). Changes take effect on the next request, without restarting.
+A bad file is rejected, and the gateway continues operating on the last valid version. Controls `ACC-TOOL-001`, `IFC-TRIFECTA-001`, and `CTL-SELF-001` are invariants: they cannot be removed.
 
-Zasady są trzech rodzajów:
-- **Fakty** (dostęp, ścieżki, przepływ danych, kwoty, godziny, budżety): rozstrzyga reguła, Jev nie jest pytany.
-- **Zasady semantyczne**: reguła z blokiem `verify:`. Gdy reguła przepuści akcję, Jev sprawdza, czy coś jej nie umknęło
-  (np. PESEL zapisany słownie, dane klienta wysłane na dozwolony host). `verify.when` zawęża, kiedy w ogóle pytać.
-- **Zasady opisowe**: tylko Jev (zgodność akcji z poleceniem, polecenia ukryte w treści, zdania z polityki firmy:
-  `detector: systemone_rule` z polem `rule`). Ich `when` to zakres; polecenia shell są wyłączone z pytania o zgodność
-  z poleceniem, bo pilnuje ich deterministyka.
+Rules come in three kinds:
+- **Facts** (access, paths, data flow, amounts, hours, budgets): resolved by rules; Jev is not asked.
+- **Semantic rules**: a rule with a `verify:` block. When the rule allows an action, Jev checks whether something was missed (for example, PESEL written in words, client data sent to an allowed host). `verify.when` narrows when to ask at all.
+- **Descriptive rules**: Jev only (action compatibility with the instruction, commands hidden in content, sentences from company policy: `detector: systemone_rule` with a `rule` field). Their `when` is a scope; shell commands are excluded from command-alignment checks because deterministic controls handle them.
 
-System One (Jev, docelowo lokalna Laya) zwraca prawdopodobieństwo, a progi w polityce zamieniają je na decyzję:
-poniżej `escalate_at` zatwierdza, od `escalate_at` kieruje do przeglądu przez człowieka, od `block_at` blokuje.
-Blokada wyniku narzędzia (np. strona z ukrytym poleceniem) oznacza, że model go nie zobaczy. Jev nigdy nie cofa decyzji
-reguły deterministycznej i nie jest pytany, gdy reguła już zablokowała. Gdy Jev nie odpowiada, zasady oceniane tylko
-przez niego trafiają do przeglądu (`on_error`), a nie są przepuszczane po cichu. Wszystkie pytania o jedną akcję idą
-w jednym wywołaniu. Każda reguła w pliku działa zawsze (enforce); żeby regułę wyłączyć, usuwa się ją z pliku — nie ma trybów monitor/off, bo kontrola albo chroni, albo jej nie ma.
+System One (Jev, eventually a local Laya) returns a probability, and the thresholds in the policy turn it into a decision:
+Below `escalate_at` it approves; from `escalate_at` it routes to human review; from `block_at` it blocks.
+Blocking the tool result (for example, a page with a hidden command) means the model never sees it. Jev never reverses a deterministic rule decision and is not asked when the rule has already blocked. When Jev does not respond, only the rules evaluated by it are escalated to review (`on_error`), not silently passed. All questions about one action go in a single call. Every rule in the file always runs (enforce); to disable a rule, remove it from the file — there are no monitor/off modes, because a control either protects or it does not.
 
-## Budżety i koszty
+## Budgets and cost
 
-Sekcje `prices` i `budgets` w pliku polityki. Każda reguła ma zakres (`org`, `desk:<nazwa>`, `agent:<id>`, z wzorcami `*`),
-okno przesuwne (minuta / godzina / dzień) i dowolne z limitów: USD, tokeny, żądania, wywołania narzędzi.
+The `prices` and `budgets` sections in the policy file. Each rule has a scope (`org`, `desk:<name>`, `agent:<id>`, with `*` patterns), a rolling window (minute / hour / day), and any of the following limits: USD, tokens, requests, tool calls.
 
-- **Rezerwacja przed wywołaniem.** Gateway rezerwuje najgorszy przypadek (szacowane wejście + `max_tokens`) na każdym
-  pasującym budżecie, zanim zapyta model. Po odpowiedzi rezerwacja zamienia się w faktyczny koszt. Równoległe agenty nie
-  przekroczą budżetu między sprawdzeniem a wydatkiem.
-- **Odmowa bez ponawiania.** Przekroczenie to `403 budget_exceeded` z nazwą budżetu, zakresem i czasem odnowienia.
-- **Bezpiecznik pętli (LOOP-001).** To samo narzędzie z tymi samymi argumentami 4× w 60 s blokuje to jedno wywołanie
-  na 120 s. Inne akcje agenta działają dalej.
-- **Modele lokalne** liczone są w sekundach GPU (`usd_per_gpu_second`), zewnętrzne w tokenach.
-- **Koszt warstwy kontroli.** Pytania do System One są liczone osobno, jako procent kosztu modeli.
-- Restart gateway nie zeruje wydatków: stan budżetów odtwarza się z łańcucha audytu.
+- **Reservation before the call.** The gateway reserves the worst case (estimated input + `max_tokens`) on each matching budget before asking the model. After the response, the reservation is converted into the actual cost. Parallel agents do not exceed the budget between verification and spending.
+- **Failure without retry.** Exceeding the budget returns `403 budget_exceeded` with the budget name, scope, and renewal time.
+- **Loop guard (LOOP-001).** The same tool with the same arguments triggers a block 4 times in 60 s, blocking that one call for 120 s. Other agent actions continue.
+- **Local models** are accounted for in GPU seconds (`usd_per_gpu_second`), external ones in tokens.
+- **Cost of the control layer.** Calls to System One are counted separately as a percentage of model cost.
+- Restarting the gateway does not reset spending: budget state is reconstructed from the audit chain.
 
-## Audyt
+## Audit
 
-`make audit` pokazuje decyzje, `make verify` sprawdza łańcuch hashy w `var/audit.jsonl` (zmiana lub usunięcie wpisu = błąd).
+`make audit` shows decisions, and `make verify` checks the hash chain in `var/audit.jsonl` (changing or deleting an entry = error).
